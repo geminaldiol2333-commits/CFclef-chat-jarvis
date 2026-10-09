@@ -1,0 +1,22 @@
+# ASCII only: pip on Chinese Windows decodes this file as GBK and chokes on UTF-8 comments.
+#
+# 本地模式（默认）不上网、不需要任何 API key；下面那些模型 SDK 里 openai 是起草走本地
+# llama-server 也要用的，其余三个只在设置里手动切到远程来源时才会 import。
+# Python: 3.11 recommended (rapidocr-onnxruntime 1.4.x requires Python <3.13).
+
+rapidocr-onnxruntime>=1.4,<2  # offline Chinese OCR; 1.2.x rejects det_limit_* ctor args and 1.4.x has no text_detector attr, so pin 1.4; all 1.4.x require Python <3.13 - on 3.13+ pip silently falls back to 1.2.3 (KeyError at startup)
+numpy                         # frames are numpy arrays; chat-area detection is all numpy
+windows-capture               # Windows Graphics Capture, captures GPU-composited windows
+PySide6-Fluent-Widgets        # overlay UI (pulls in PySide6); GPLv3, see NOTICE
+pillow                        # only for the synthetic images in probe/
+
+# model SDKs: one official client per protocol, no hand-written HTTP (see core/llm.py)
+openai                        # required: local drafting + OpenAI-compatible remote sources
+typesafe-sdk                  # optional: remote TypeSafe judge (设置里选 TypeSafe 直连时才用)
+anthropic                     # optional: Anthropic Messages remote drafting
+google-genai                  # optional: Google Gemini remote drafting
+
+winsdk                        # Windows.Media.Ocr: the ko/ja recognizers RapidOCR's zh/en models lack
+
+# optional, only for the two old UIA probes (already disproved; install to reproduce)
+# uiautomation                # probe_win.py / probe_win2.py

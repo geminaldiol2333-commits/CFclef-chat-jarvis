@@ -1,0 +1,95 @@
+CFclef-chat-jarvis
+Copyright (c) 2026 geminaldiol2333-commits and the CFclef-chat-jarvis contributors
+https://github.com/geminaldiol2333-commits/CFclef-chat-jarvis
+
+本项目自身新增/修改的代码以 Apache License 2.0 授权（见 LICENSE），并保留上游的 MIT 授权（见
+LICENSES/MIT-upstream.txt）。两份授权对上游代码同时有效：上游部分仍可按 MIT 使用。
+
+## 与上游的关系
+
+CFclef-chat-jarvis 是 jev-chat-windows 的二次开发（fork），把判断/排序内核从云端 Jev 换成
+**本地运行的 Cloudflare clef-flash**，并把起草换成第二个本地文本模型，全程离线、不需要 API key。
+
+    上游链：
+      jev-chat-JARVIS（Android，判断内核与题目口径的源头）
+        https://github.com/Finderchangchang/jev-chat-JARVIS
+        Copyright (c) 2026 Finderchangchang and the jev-chat contributors
+      jev-chat-windows（Windows 版，本项目直接 fork 自它）
+        https://github.com/jev-chat/jev-chat-windows
+        Copyright (c) 2026 rezoch340 and the jev-chat contributors
+
+上游代码以 MIT 授权发布，其 LICENSE 原文见 LICENSES/MIT-upstream.txt，本 NOTICE 与 LICENSE 均予保留。
+「Jev」「jev-chat」「Jev 聊天助手」等名称与 chatjevs.com 域名归上游作者所有；本项目不使用这些名称
+暗示由上游出品或背书，仅作事实性出处说明。
+
+## 相对上游的改动（Apache-2.0 §4(b)）
+
+- 判断/排序来源新增并默认使用「本地 clef-flash」：走 llama.cpp 的 `POST /v1/systemone`
+  （core/providers.py、core/jev_client.py::_ask_local）。
+- 起草来源新增并默认使用「本地文本模型」：走 llama.cpp 的 OpenAI 兼容接口，免 API key
+  （core/providers.py、core/draft.py、core/llm.py）。
+- 新增 app/local_server.py：由程序自动拉起/预热/空闲卸载 llama-server（clef 与起草各一个进程）。
+- 设置持久化新增本地模型相关项（app/settings.py），设置页新增「本地模型」卡片（app/overlay.py）。
+- 默认来源改为本地，本地模式不再要求 API key；远程来源保留为可选。
+- 项目更名、窗口标题/打包产物/更新检查地址改为本仓库；移除上游的公众号横幅。
+- 授权由上游的 MIT 改为本项目 Apache-2.0（上游部分仍为 MIT）。
+
+## 模型
+
+clef-flash（Cloudflare）以 Apache-2.0 发布，**不在本仓库内**，需自行下载：
+https://hf-mirror.com/Cloudflare/clef-flash  ·  https://hf-mirror.com/ggml-org/Clef-Flash-GGUF
+clef-flash 是决策模型（只输出每个选项的概率，不生成自由文本），因此起草那一步需要另一个普通文本
+模型；模型由其各自作者授权，与本项目授权无关。
+
+## 第三方组件
+
+| 组件 | 许可证 | 备注 |
+| --- | --- | --- |
+| PySide6-Fluent-Widgets | GPLv3 | 非商用免费；商用需向 https://qfluentwidgets.com/price 购买商业授权 |
+| PySide6 | LGPL-3.0 | Qt for Python 官方绑定 |
+| RapidOCR (rapidocr-onnxruntime) | Apache-2.0 | 离线中文 OCR |
+| windows-capture | MIT | Windows Graphics Capture 的 Python 绑定 |
+| openai | Apache-2.0 | 起草走 OpenAI 兼容协议的官方 SDK（本地 llama-server 也用它） |
+| anthropic | MIT | Anthropic 官方 SDK（可选，仅远程来源） |
+| google-genai | Apache-2.0 | Google Gemini 官方 SDK（可选，仅远程来源） |
+| typesafe-sdk | MIT | TypeSafe 官方 SDK（可选，仅远程 Jev 来源） |
+| llama.cpp | MIT | 本地推理服务端，单独分发，不在本仓库内 |
+
+## 发布包的整体授权
+
+Python 源码按上面的分工（本项目 Apache-2.0 + 上游 MIT）授权。但 **PyInstaller 打出来的 Windows
+发布包还打包了 GPLv3 的 PySide6-Fluent-Widgets，所以发布包整体受 GPLv3 约束**：想商用的人请自行
+向该组件作者购买商业授权，或者自己换掉这个组件。本项目不代为处理，也不对发布包能否商用做任何保证。
+
+Apache-2.0 与 GPLv3 兼容（GPLv3 兼容 Apache-2.0），因此本项目的 Apache-2.0 源码可以与 GPLv3 组件
+组合分发。
+
+---
+
+This project's own code (new and modified files) is licensed under the Apache
+License 2.0 (see LICENSE). Upstream portions remain under the MIT License (see
+LICENSES/MIT-upstream.txt), which is preserved as required.
+
+CFclef-chat-jarvis is a fork of jev-chat-windows
+(https://github.com/jev-chat/jev-chat-windows, Copyright (c) 2026 rezoch340 and
+the jev-chat contributors), which in turn derives its decision engine and
+question set from jev-chat-JARVIS
+(https://github.com/Finderchangchang/jev-chat-JARVIS, Copyright (c) 2026
+Finderchangchang and the jev-chat contributors).
+
+The main changes from upstream are: the judging/ranking step now runs the local
+Cloudflare clef-flash decision model over llama.cpp's `/v1/systemone`; the drafting
+step runs a second local text model; app/local_server.py launches and supervises the
+llama-server processes; local providers are the defaults and need no API keys;
+project branding and the update-check URL point to this repository; the upstream
+WeChat banner is removed; and this project is distributed under Apache-2.0 while
+upstream portions remain MIT.
+
+"Jev", "jev-chat", "Jev Chat Assistant" and the chatjevs.com domain belong to the
+upstream authors. This project does not use them to imply endorsement, only for
+factual attribution.
+
+The model weights (Cloudflare clef-flash, Apache-2.0) are NOT included in this
+repository; download them yourself. The Windows release bundle additionally
+includes PySide6-Fluent-Widgets (GPLv3, free for non-commercial use), so the
+bundle as a whole is bound by GPLv3 terms.

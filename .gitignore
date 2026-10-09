@@ -1,0 +1,26 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
+
+# 每个人自己的设置，不进仓库（.gitignore 里 # 只能整行注释，写在模式后面会变成模式的一部分）
+config.json
+# 根目录下的临时截图（docs/ 里的照常提交）
+/*.png
+wechat_probe.png
+
+# 模型权重一律不进仓库：clef-flash 是 Apache-2.0，但体积太大，请自行下载
+*.gguf
+models/
+
+# 本地拉起来的 llama-server 日志（正常情况下只在内存里，这里兜个底）
+logs/
+*.log
+
+# PyInstaller 产物（cfclef.spec 是源文件，照常提交）
+build/
+dist/
+*.spec.bak
