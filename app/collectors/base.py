@@ -6,8 +6,7 @@
 
 现在有两种实现（见 app/collectors/）：
   ocr_wechat —— 微信：WGC 抓帧 + 像素定位 + 离线 OCR（原有逻辑搬过来的）
-  （QQ NT 走哪条路见 docs/QQNT.md：UIA 在 QQ 9.9.36 上读不到聊天内容，
-    实测证据写在那里；像素路线待实现）
+  uia_qqnt   —— QQ NT：读 UIA 无障碍树（类名取节点、container--self 判己方），不 OCR、不比像素
 
 采集器跑在采集子进程里（app/worker.py），只通过队列和父进程说话，
 所以 emit() 出去的东西必须是纯 tuple/str/bytes（不能带 numpy 或 COM 对象）。

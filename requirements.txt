@@ -12,6 +12,7 @@ pillow                        # only for the synthetic images in probe/
 
 # model SDKs: one official client per protocol, no hand-written HTTP (see core/llm.py)
 openai                        # required: local drafting + OpenAI-compatible remote sources
+uiautomation                  # required for QQ NT: reads the a11y tree (WeChat does not need it)
 typesafe-sdk                  # optional: remote TypeSafe judge (设置里选 TypeSafe 直连时才用)
 anthropic                     # optional: Anthropic Messages remote drafting
 google-genai                  # optional: Google Gemini remote drafting

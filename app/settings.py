@@ -150,6 +150,23 @@ def local_idle_unload() -> bool:
 def local_idle_seconds() -> int:
     return _int("local_idle_seconds", _DEFAULT_IDLE_SECONDS, 30, 86400)
 
+
+# --- QQ NT（UIA 采集）---
+def qq_focus_policy() -> str:
+    """读 QQ 无障碍树时的前台策略。
+    steal      （默认）读之前把 QQ 置前、读完把焦点还回去；屏幕会闪一下。
+    foreground 完全不抢焦点；QQ 不在前台就跳过这一拍。
+    QQ 只对前台窗口构建完整 UIA 树，所以这两个之外没有别的选择。"""
+    v = str(_read("qq_focus_policy") or "steal").strip().lower()
+    return v if v in ("steal", "foreground") else "steal"
+
+
+def qq_selectors() -> dict:
+    """覆盖 QQ 的 UIA 选择器（QQ 大版本改类名时才需要动）。
+    config.json 写成："qq_selectors": {"editor": ["qq-msg-editor"], ...}"""
+    v = _read("qq_selectors")
+    return v if isinstance(v, dict) else {}
+
 def _read_env(env_name: str) -> str:
     """进程环境优先；没有就读注册表并带进进程环境，之后 core/ 里按 os.environ 读就有了。"""
     v = os.environ.get(env_name, "").strip()
@@ -222,7 +239,8 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
          local_llama_server_text: str | None = None,
          local_models_dir_text: str | None = None, local_clef_model_text: str | None = None,
          local_draft_model_text: str | None = None, local_autostart_on: bool | None = None,
-         local_idle_unload_on: bool | None = None, local_idle_seconds_n: int | None = None) -> None:
+         local_idle_unload_on: bool | None = None, local_idle_seconds_n: int | None = None,
+         qq_focus_policy_text: str | None = None) -> None:
     """每个参数为空/None = 保留当前值。两把 key 写进程环境 + HKCU\\Environment，不写任何文件。"""
     jev = jev_provider_text if jev_provider_text in JEV_PROVIDERS else jev_provider()
     draft = draft_provider_text if draft_provider_text in DRAFT_PROVIDERS else draft_provider()
@@ -260,6 +278,9 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
         "local_idle_unload": flag(local_idle_unload_on, local_idle_unload),
         "local_idle_seconds": (local_idle_seconds() if local_idle_seconds_n is None
                                else max(30, min(86400, int(local_idle_seconds_n)))),
+        "qq_focus_policy": (qq_focus_policy() if qq_focus_policy_text is None
+                            else (qq_focus_policy_text if qq_focus_policy_text in ("steal", "foreground")
+                                  else qq_focus_policy())),
     }
     with open(_CONFIG, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)

@@ -13,7 +13,7 @@ __all__ = ["BaseCollector", "Capabilities", "Collector", "Emit", "Media", "Turn"
 
 def engines() -> tuple[str, ...]:
     """可用的采集引擎名。"""
-    return ("ocr", "pixel", "uia")
+    return ("ocr", "uia")
 
 
 def build(app, hwnd, emit, debug_on=None) -> BaseCollector:
@@ -23,8 +23,17 @@ def build(app, hwnd, emit, debug_on=None) -> BaseCollector:
         from app.collectors.ocr_wechat import OcrWechatCollector
 
         return OcrWechatCollector(hwnd, emit, debug_on, app=app)
-    if engine == "pixel":
-        from app.collectors.pixel_qqnt import PixelQqntCollector
+    if engine == "uia":
+        from app.collectors.uia_qqnt import UiaQqntCollector
+        from app.collectors.uia_map import sel_from
 
-        return PixelQqntCollector(hwnd, emit, debug_on, app=app)
+        try:  # 设置只在运行时读，采集器本身不依赖 app.settings（保持可离线测试）
+            from app import settings
+
+            policy = settings.qq_focus_policy()
+            selectors = sel_from(settings.qq_selectors())
+        except Exception:
+            policy, selectors = "steal", sel_from(None)
+        return UiaQqntCollector(hwnd, emit, debug_on, app=app,
+                                selectors=selectors, focus_policy=policy)
     raise RuntimeError(f"未知采集引擎：{engine!r}（app/chatapps.py 里的 collector 字段）")

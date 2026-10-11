@@ -250,25 +250,38 @@ hf download ggml-org/Clef-Flash-GGUF Clef-Flash-Q8_0.gguf --local-dir D:\AI_Tool
 
 ## 支持的聊天软件
 
-| 软件 | OCR | 自己的气泡 | 窗口 |
+| 软件 | 采集方式 | 自己的气泡 | 窗口 |
 | --- | --- | --- | --- |
-| 微信 | RapidOCR（中英文模型） | 绿色 | 标题为「微信」的主窗口 |
+| 微信 | RapidOCR（中英文模型）+ 像素定位 | 绿色 | 标题为「微信」的主窗口 |
+| **QQ NT** | **UIA 无障碍树**（不 OCR、不比颜色） | `container--self` 类名 | 效率模式的主面板；经典模式下选真正在聊的那个窗口 |
 
-新增一个软件只要在 `app/chatapps.py` 里加一行（窗口进程名、要挑哪个窗口、哪种底色算自己说的）。
-OCR 用 RapidOCR 的中英文模型；上游为韩文 KakaoTalk 加的 Windows.Media.Ocr 后端已经随 KakaoTalk
-适配一起移除了（历史版本见 git 记录）。
+采集器在 `app/collectors/`：微信是 `ocr_wechat.py`（截图 + OCR），QQ NT 是 `uia_qqnt.py`
+（读无障碍树，纯逻辑在 `uia_map.py`，可离线自测）。加一个软件 = `app/chatapps.py` 加一条
++ 必要时写一个采集器；`worker.py` / `main.py` 不用改。
 
-**QQ NT（Windows）目前还不支持。** 调研、参考项目、实测数据和可行路线都记在
-[docs/QQNT.md](docs/QQNT.md)。早期看好走 UIA 无障碍树（社区公开了 `qq-msg-editor`、
-`container--self` 等控件类名），但**实测在 QQ 9.9.31 / 9.9.36 上这些类名根本不存在**：
-加上 `--force-renderer-accessibility` 后树能从 9 个节点涨到 389 个，但类名全空、文本节点没有几何信息、
-消息输入框没暴露、聊天区是 D3D 合成——拿不到「谁说的、说了什么、输入框在哪」。
-所以 QQ 改走**像素路线**（WGC 抓帧 + QQ 专用面板/输入框定位 + OCR + 高蓝低红判己方），
-实测配色与探针都在文档里。
+### QQ NT 怎么用
 
-采集器接口（P0）已经落地：`app/collectors/`（`base.py` + `ocr_wechat.py`）+ `ChatApp.collector`
-引擎字段，QQ 的像素采集器接上即可，`worker.py` / `main.py` 不用改。
-架构设计见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+1. **QQ 必须处于活动状态**（或允许读取时短暂置前）——QQ 只对前台窗口构建完整无障碍树。
+   设置页「QQ NT（UIA 读取）」卡片里选：*允许读取时短暂置前（默认）* 或 *只在 QQ 已在前台时读取*。
+2. 如果树一直是空的（只有十来个控件），用 `--force-renderer-accessibility` 启动 QQ 再试
+   （无 GPU 设备尤其需要）。采集器会在状态栏直接提示这一点。
+3. 选择器来自社区实测（`qq-msg-editor` / `chat-header__contact-name` / `container--self`），
+   QQ 大版本改类名时可在 `config.json` 里用 `qq_selectors` 覆盖；认不出时只报可诊断的提示，
+   **不会退回 OCR**。
+
+离线自测（不装 uiautomation、不开窗口）：
+
+```bat
+python -m app.collectors.uia_map      :: 合成树的纯逻辑
+python -m app.collectors.uia_qqnt     :: 假 uiautomation：事件流转/去重/换会话/提示
+```
+
+真机校准（只读：不启动、不点击、不截图、不含消息文本）：
+
+```bat
+python probe\probe_qq_uia.py --dump qq_tree.json
+python probe\qq_uia_verdict.py qq_tree.json
+```
 
 ## 故障排查
 

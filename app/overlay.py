@@ -554,6 +554,28 @@ class Overlay:
         ))
         body.addWidget(preference)
 
+        qq = _Surface()
+        box = QVBoxLayout(qq)
+        box.setContentsMargins(16, 16, 16, 18)
+        box.setSpacing(12)
+        box.addWidget(_tlabel("QQ NT（UIA 读取）", 16, "#304c3c", True))
+        box.addWidget(self._hint(
+            "QQ 只对前台窗口构建完整无障碍树（后台只有十来个节点），所以读消息时必须让 QQ 处于活动状态；"
+            "解不出来时不会退回 OCR，会直接提示。"))
+        qq_label = _tlabel("读取方式", 13)
+        box.addWidget(qq_label)
+        self.qqFocusBox = ComboBox()
+        self.qqFocusBox.setMinimumWidth(0)
+        self.qqFocusBox.addItems(["允许读取时短暂置前（读完把焦点还回去）",
+                                  "只在 QQ 已在前台时读取（不抢焦点）"])
+        bind(self.qqFocusBox, "QQ 读取方式", "setAccessibleName")
+        qq_label.setBuddy(self.qqFocusBox)
+        box.addWidget(self.qqFocusBox)
+        box.addWidget(self._hint(
+            "选第一种：QQ 在后台时也能读，但屏幕会闪一下、正在打字时可能被打断。"
+            "选第二种：完全不打扰，但你切走就停更。"))
+        body.addWidget(qq)
+
         models = _Surface()
         box = QVBoxLayout(models)
         box.setContentsMargins(16, 16, 16, 18)
@@ -952,6 +974,7 @@ class Overlay:
         self.localDraftEdit.setText(settings.local_draft_model())
         self.localAutoSwitch.setChecked(settings.local_autostart())
         self.localUnloadSwitch.setChecked(settings.local_idle_unload())
+        self.qqFocusBox.setCurrentIndex(0 if settings.qq_focus_policy() == "steal" else 1)
         self._sync_model_fields()  # 上面屏蔽了信号，这里补一次
         self.settingsFeedback.hide()
 
@@ -1006,7 +1029,9 @@ class Overlay:
                           local_clef_model_text=self.localClefEdit.text().strip(),
                           local_draft_model_text=self.localDraftEdit.text().strip(),
                           local_autostart_on=self.localAutoSwitch.isChecked(),
-                          local_idle_unload_on=self.localUnloadSwitch.isChecked())
+                          local_idle_unload_on=self.localUnloadSwitch.isChecked(),
+                          qq_focus_policy_text=("steal" if self.qqFocusBox.currentIndex() == 0
+                                                else "foreground"))
         except Exception:
             self._settings_feedback("保存失败，请检查配置文件是否可写后重试。", error=True)
             return

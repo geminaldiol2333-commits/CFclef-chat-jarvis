@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 """消息区截图 → 谁说了什么。RapidOCR 吃 numpy，不落盘。"""
-import difflib
 import re
 import time
 
@@ -8,6 +7,7 @@ import numpy as np
 from rapidocr_onnxruntime import RapidOCR
 
 from app.chatapps import DEFAULT, ChatApp
+from app.textsim import similar  # noqa: F401  （历史名字：本来定义在这里，现在搬到 app/textsim.py）
 
 _ENGINE = None  # one RapidOCR instance per process (~40MB); every Reader shares it
 
@@ -65,11 +65,8 @@ def who_said(chat, box, app: ChatApp = DEFAULT):
     return ("her" if diff.max() >= 150 else "gray"), bg, ink_h
 
 
-def similar(a, b):
-    """同一段像素挪个位置 OCR 会抖（「傻逼了」↔「傻逼」、「不好意思」↔「不好竟思」），按相似度判同一条。"""
-    if a == b or difflib.SequenceMatcher(None, a, b).ratio() >= 0.75:
-        return True
-    return len(a) == len(b) >= 3 and sum(x != y for x, y in zip(a, b)) <= 1  # 短句错一个字
+def _unused_similar_placeholder():  # pragma: no cover
+    return None
 
 
 class Reader:

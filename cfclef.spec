@@ -12,6 +12,9 @@ hiddenimports = [
     "app.worker", "app.capture", "app.ocr", "app.fill", "app.overlay", "app.settings",
     "app.version", "app.update", "app.debugwin",  # debugwin 是开了调试视图才 import 的
     "app.local_server",  # 本地模型进程管理，运行时才 import
+    "app.collectors.base", "app.collectors.ocr_wechat", "app.collectors.uia_map",
+    "app.collectors.uia_qqnt",   # QQ NT 的 UIA 采集器，只在跑 QQ 时才 import
+    "app.textsim",
     "core.engine", "core.draft", "core.jev_client", "core.questions", "core.providers",
     "core.llm",
 ]
@@ -23,6 +26,8 @@ for pkg in (
     "windows_capture",       # Rust 编译的 .pyd
     # 四个模型 SDK：core/llm.py 和 jev_client 里是**函数内 import**，静态分析扫不到，必须显式收
     "openai",
+    "uiautomation",          # QQ NT 采集：UIA 封装（会带出 comtypes）
+    "comtypes",
     "typesafe_sdk",
     "anthropic",
     "google.genai",
