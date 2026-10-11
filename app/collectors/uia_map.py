@@ -332,28 +332,34 @@ def turns_from_containers(nodes: Sequence[Node], list_node: Node,
     """按消息容器读消息——有群等级/群头衔这类高特征文本时最可靠的一条路。
 
     每个容器里的文本按 y 聚行：
-      · 第一行是「名字行」：同一行上深度最小的那串是昵称，剩下的短串是徽标（等级/头衔）；
+      · 名字行：同一行上深度最小的那串是昵称，剩下的短串是徽标（群等级/群头衔）；
       · 其余行是正文。
-    判己方/对方：
-      · 有名字行 → 对方发的（QQ 不会在自己的消息上方重复自己的昵称）；
-      · 没名字行 → 靠右 = 我发的；居中（±8% 宽）= 系统提示，丢掉；
-      · 没名字行也没几何 → 丢掉（虚拟列表里没布局的那种，读了也不准）。
 
-    ponytail: 实测只有“全部子文本都有几何”的容器可读（已渲染的）；其余全部几何为 0，
-    那是虚拟列表滑动出去的项，直接跳过，不猜。
+    **己方/对方只用几何判（靠右 = 我）**，不靠“有没有名字行”——实测自己发消息时
+    QQ 同样会把昵称+徽标打在上面（自己那条的 d14 是 28 字的昵称），用名字行判会把
+    自己的消息当成对方的。
+
+    名字行的另一个作用：QQ 只在**发言人变化时**才显示昵称，所以没名字行的容器就继承
+    上一个容器的发言人（几何对得上才继承，对不上就按几何算）。
+    居中的（±8% 宽）当系统提示丢掉；没正文的（图片/表情包）会自然跳过。
+
+    ponytail: 只读“全部子文本都有几何”的容器（已渲染的）；虚拟列表滑出去的项几何全为 0，
+    直接跳过，不猜。
     """
     if list_node is None or not list_node.has_geo:
         return []
     width = max(1, list_node.rect[2] - list_node.rect[0])
     mid = list_node.rect[0] + width / 2
     turns: list[Turn] = []
+    prev_who: str | None = None
+    prev_name: str | None = None
     for c in message_containers(nodes, list_node):
         texts = [t for t in descendants(nodes, c)
                  if t.type == "TextControl" and t.has_text and t.has_geo]
         if not texts:
             continue                     # 没布局的容器整条跳过，不猜
         rows = _rows_by_y(texts, _glyph_gap(texts))
-        # 只有一行、而且这一行不止一段（昵称+徽标）→ 这是「有名字没正文」的消息，丢掉
+        # 只有一行、而且这一行不止一段（昵称+徽标）→ 「有名字没正文」：图片/表情包/纯转发，跳过
         if len(rows) == 1 and len(rows[0]) >= 2:
             continue
         name, body_rows = None, rows
@@ -375,15 +381,17 @@ def turns_from_containers(nodes: Sequence[Node], list_node: Node,
                        for n in sorted(r, key=lambda n: n.rect[0])).strip()
         if not body:
             continue
-        if name:
-            who = "her"
-        else:
-            flat = [n for r in body_rows for n in r]
-            cx = (min(n.rect[0] for n in flat) + max(n.rect[2] for n in flat)) / 2
-            if abs(cx - mid) <= 0.08 * width:
-                continue                 # 居中 = 系统提示（入群/撤回/公告）
-            who = "me" if cx > mid else "her"
+        flat = [n for r in body_rows for n in r]
+        cx = (min(n.rect[0] for n in flat) + max(n.rect[2] for n in flat)) / 2
+        if abs(cx - mid) <= 0.08 * width:
+            continue                     # 居中 = 系统提示（入群/撤回/公告）
+        who = "me" if cx > mid else "her"
+        if name is None and prev_who is not None and (cx > mid) == (prev_who == "me"):
+            who, name = prev_who, prev_name      # 发言人没变，QQ 不重复显示昵称
+        elif who == "me":
+            name = None                          # 自己那条上的昵称/头衔不当“对方名字”用
         turns.append(Turn(who=who, text=body, name=name))
+        prev_who, prev_name = who, name
     return turns
 
 
@@ -666,18 +674,26 @@ if __name__ == "__main__":
                                          (15, 898, 264, 913, "LV"),
                                          (15, 913, 264, 935, "99"),
                                          (16, 830, 299, 988, "四个字符")])
-    # 只有名字行（没正文）→ 丢掉
-    add_container("7000000000000000002", [(14, 817, 364, 848, "两字"),
-                                         (15, 857, 364, 872, "LV"),
-                                         (15, 871, 364, 887, "9")])
-    # 自己发的：没名字行、靠右 → me
-    add_container("7000000000000000003", [(16, 1500, 400, 1800, "我自己发的")])
-    # 系统提示：没名字行、居中 → 丢掉
-    add_container("7000000000000000004", [(16, 1200, 450, 1550, "系统提示一条")])
+    # 同一个人接着说：QQ 不重复显示昵称 → 继承上一条的发言人
+    add_container("7000000000000000002", [(16, 830, 340, 988, "接着说的一句")])
+    # 自己发的：**真机实测自己那条也带昵称+徽标**（d14 是 28 字的昵称），正文靠右
+    # → who 靠几何判 = me，而且不能把自己的昵称当成“对方名字”
+    add_container("7000000000000000003", [(14, 1611, 400, 1925, "我自己的昵称头衔很长"),
+                                         (15, 1573, 401, 1588, "LV"),
+                                         (15, 1587, 401, 1602, "99"),
+                                         (16, 1773, 435, 1913, "我自己发的")])
+    # 自己连着发（无名字行）→ 仍然是 me
+    add_container("7000000000000000004", [(16, 1773, 475, 1913, "又一条")])
+    # 系统提示：居中 → 丢掉
+    add_container("7000000000000000005", [(16, 1200, 520, 1550, "系统提示一条")])
+    # 只有名字行没正文（图片/表情包那种）→ 丢掉
+    add_container("7000000000000000006", [(14, 817, 560, 848, "两字"),
+                                         (15, 857, 560, 872, "LV"),
+                                         (15, 871, 560, 887, "9")])
     # 虚拟列表里没布局的（全无几何）→ 整条跳过，不猜
-    add_container("7000000000000000005", [(14, 817, 500, 848, "两字"),
-                                         (15, 857, 500, 872, "LV"),
-                                         (16, 830, 535, 988, "看不见")], geo=False)
+    add_container("7000000000000000007", [(14, 817, 600, 848, "两字"),
+                                         (15, 857, 600, 872, "LV"),
+                                         (16, 830, 635, 988, "看不见")], geo=False)
 
     pane_left, _ = pane_bounds(gn, PANEL)
     lst = find_message_list(gn, pane_left)
@@ -685,7 +701,9 @@ if __name__ == "__main__":
     turns = build_turns(gn, pane_left=pane_left, list_node=lst)
     assert [(t.who, t.name, t.text) for t in turns] == [
         ("her", "昵称六个字", "四个字符"),
-        ("me", None, "我自己发的"),
+        ("her", "昵称六个字", "接着说的一句"),      # 继承发言人
+        ("me", None, "我自己发的"),                  # 带昵称行也归我（靠右）
+        ("me", None, "又一条"),                      # 连着发 → 仍然是我
     ], turns
 
     # ── 会话名：优先用消息列表外层 WindowControl 的 Name（实测它就是会话标题）────
