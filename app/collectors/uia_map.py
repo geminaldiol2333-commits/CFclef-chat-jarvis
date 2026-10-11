@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import re
+import re
 from dataclasses import dataclass, replace
 from typing import Iterable, Sequence
 
@@ -185,39 +186,51 @@ def _rows_by_y(nodes: Sequence[Node], gap: int) -> list[list[Node]]:
     return rows
 
 
-def find_session_node(nodes: Sequence[Node], pane_left: int, sel: Selectors = SEL_DEFAULT,
-                      list_node: Node | None = None, panel_right: int = 0) -> Node | None:
-    """会话名所在节点（内容用 .text）。dump 里没有文本时也能用这个判断「定位到了没有」。
+def find_session_row(nodes: Sequence[Node], pane_left: int, sel: Selectors = SEL_DEFAULT,
+                     list_node: Node | None = None, panel_right: int = 0) -> list[Node]:
+    """头部那一行的所有文本节点（按 x 排好）。
 
-    类名命中（`chat-header__contact-name`）优先；本机实测没这个类名，
-    退回几何：消息列表**上方**、聊天区里最靠左的那条文本（实测在 y=281、x=855，
-    而它右边跟着的几条是成员数/按钮，都比它靠右）。"""
+    为什么要「一行」而不是「一条」：QQ 的头部会被切成好几个文本节点
+    （实测同一行上有 len=12 / 1 / 21 / 5 四段），只取最左边那条会只拿到一个碎片，
+    而且随头部状态（成员数、按钮）飘。会话名最终取这一行拼起来的结果。
+    """
     hit = find_first(nodes, sel.header)
     if hit is not None and hit.has_text:
-        return hit
+        return [hit]
     if list_node is None or not list_node.has_geo:
-        return None
+        return []
     above = [n for n in nodes if n.type == "TextControl" and n.has_text
              and n.has_geo and n.rect[1] < list_node.rect[1]
              and n.rect[0] >= pane_left - PANE_TOL and n.rect[2] <= (panel_right or 10 ** 9)]
     if not above:
-        return None
+        return []
     # 取「最靠近消息列表顶部的那一行」——与缩放/最大化无关，
     # 比写死「上方 80px」稳：再往上是标题栏和窗口按钮（实测那里有个 1 字符按钮）。
     heights = sorted(n.height for n in above)
     gap = max(4, int(0.6 * heights[len(heights) // 2]))
     rows = _rows_by_y(above, gap)
-    row = rows[-1]                                  # 最下面那行 = 紧贴消息列表上方
-    longer = [n for n in row if len(n.text.strip()) >= 2]
-    if longer:
-        row = longer
-    return min(row, key=lambda n: n.rect[0])
+    return sorted(rows[-1], key=lambda n: n.rect[0])
+
+
+def find_session_node(nodes: Sequence[Node], pane_left: int, sel: Selectors = SEL_DEFAULT,
+                      list_node: Node | None = None, panel_right: int = 0) -> Node | None:
+    """头部行的第一个节点（给「定位到了吗」用）。"""
+    row = find_session_row(nodes, pane_left, sel, list_node=list_node, panel_right=panel_right)
+    return row[0] if row else None
 
 
 def find_session(nodes: Sequence[Node], pane_left: int, sel: Selectors = SEL_DEFAULT,
                  list_node: Node | None = None, panel_right: int = 0) -> str:
-    node = find_session_node(nodes, pane_left, sel, list_node=list_node, panel_right=panel_right)
-    return node.text.strip() if node is not None else ""
+    """当前会话名（当历史记录的 key）：头部行拼接，去尾部的群成员数。
+
+    拼一整行而不是取一条：一来不会只拿到碎片，二来这个 key 越完整越不会两个会话碰在一起。
+    ponytail: 头部显示内容变了（如成员数增加）会当成新会话；所以去掉尾部的 `(1234)`。
+    """
+    row = find_session_row(nodes, pane_left, sel, list_node=list_node, panel_right=panel_right)
+    if not row:
+        return ""
+    text = "".join(n.text.strip() for n in row).strip()
+    return re.sub(r"[（(]\d+[)）]\s*$", "", text).strip()
 
 
 def find_editor(nodes: Sequence[Node], pane_left: int, sel: Selectors = SEL_DEFAULT,
@@ -433,7 +446,8 @@ if __name__ == "__main__":
     assert pane_left == 832, pane_left          # 聊天区自己那块容器的左边缘（实测 832）
     lst = find_message_list(real, pane_left)
     assert lst is not None and lst.rect == (832, 325, 1880, 907), lst
-    assert find_session(real, pane_left, list_node=lst, panel_right=PANEL[2]) == "甲方"
+    assert find_session(real, pane_left, list_node=lst, panel_right=PANEL[2]) == "甲方群聊", \
+        find_session(real, pane_left, list_node=lst, panel_right=PANEL[2])   # 整行拼接 + 去掉尾部成员数
     ed = find_editor(real, pane_left, list_node=lst, panel_right=PANEL[2])
     assert ed is not None and ed.rect == (832, 956, 1880, 1095), ed      # 不是工具栏、也不是半宽工具条
     turns = build_turns(real, pane_left=pane_left, list_node=lst)

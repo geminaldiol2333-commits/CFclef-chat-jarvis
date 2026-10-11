@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes as w
+import os
 import time
 
 from app.collectors.base import BaseCollector, Capabilities
@@ -190,6 +191,53 @@ class UiaQqntCollector(BaseCollector):
 
     # ---------------------------------------------------------------- 每拍
 
+    def _empty_reason(self, nodes) -> str:
+        """聊天区里读不到东西时说清楚是哪种原因。
+
+        先查 QQ 进程的命令行里到底有没有 --force-renderer-accessibility——这个最权威；
+        查不到才退回「树里有没有 Web 内容的 id（ml-root / func-bar-*）」这个箱底办法。
+        """
+        flag = self._a11y_flag_on()
+        if flag is False:
+            return ("QQ 没带 --force-renderer-accessibility 启动，所以它的聊天内容不在无障碍树里。"
+                    "关掉 QQ 后用 scripts\\restart-qq-with-a11y.bat 重新启动"
+                    "（或手动：QQ.exe --force-renderer-accessibility），然后跑 probe\\probe_qq_uia.py 验证。")
+        if flag is True:
+            return ("QQ 的无障碍开关是开的，但聊天区里读不到消息列表/气泡——"
+                    "可能没打开会话、会话还在加载，或者这个 QQ 版本结构变了。"
+                    "先在 QQ 里点开一个会话；还不行就用 probe\\probe_qq_uia.py 抓一份树来对"
+                    "（config.json 里可用 qq_selectors 覆盖）。")
+        # 命令行拿不到：退回 id 判断
+        web_ids = ("ml-root", "func-bar", "searchResultScrollView", "md-tips__")
+        if not any(any(w in n.aid for w in web_ids) for n in nodes):
+            return ("QQ 的聊天内容不在无障碍树里——它可能没有带 --force-renderer-accessibility 启动。"
+                    "关掉 QQ 后用 scripts\\restart-qq-with-a11y.bat 重新启动。")
+        return ("QQ 的聊天区里读不到消息列表/气泡——可能没打开会话或者结构变了。"
+                "先点开一个会话；还不行就用 probe\\probe_qq_uia.py 抓一份树来对。")
+
+    @staticmethod
+    def _a11y_flag_on() -> bool | None:
+        """QQ 进程的命令行里有没有 --force-renderer-accessibility。
+
+        没这个开关时 Chromium 不把 Web 内容暴露给 UIA，我们什么都读不到。
+        拿不到（没 PowerShell / 超时）返回 None，由调用方退回树启发式。
+        """
+        if os.name != "nt":
+            return None
+        import subprocess
+        try:
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 "(Get-CimInstance Win32_Process -Filter \"Name='QQ.exe'\").CommandLine"],
+                capture_output=True, text=True, timeout=10, errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout or ""
+        except Exception:
+            return None
+        lines = [ln for ln in out.splitlines() if ln.strip()]
+        if not lines:
+            return None                      # QQ 没在跑 / 查不到，别乱下结论
+        return any("--force-renderer-accessibility" in ln for ln in lines)
+
     def poll(self, emit) -> None:
         # 0. 限速：读一棵树要几百毫秒（+ 等建树 0.8s），不能跟着 worker 的 50ms 循环跑。
         #    注意：worker 是每拍调一次 poll，这里自己管节流。
@@ -250,7 +298,19 @@ class UiaQqntCollector(BaseCollector):
         # 2. 会话名 / 聊天区
         name = find_session(nodes, pane_left, self.sel, list_node=list_node,
                             panel_right=panel_right)
-        if name and name != self.title:
+        if not name:
+            if list_node is None and not has_bubbles:
+                # 连消息列表都没有：先说是「没开关」还是「没开会话」
+                self._note_once("no-list", self._empty_reason(nodes))
+                return
+            # 会话名读不到时**不读消息**：否则切了会话但名字这一拍没读到，新会话的消息会被算到
+            # 上一个会话的账上（历史/上下文全串了）。宁可这一拍什么都不发，下一拍（≥1.2s）就好了。
+            self._note_once(
+                "no-name",
+                "这一拍读不到会话名（QQ 头部暂时不可读，切会话后常见）——先不读消息，"
+                "以免把不同会话的消息混在一起。")
+            return
+        if name != self.title:
             self.title = name
             self.seen.clear()          # 换会话：去重状态跟着换（和 OCR 采集器一致）
             emit("chat", name)
@@ -281,6 +341,13 @@ class UiaQqntCollector(BaseCollector):
                             "可在 config.json 里用 qq_selectors.editor 覆盖类名。")
 
         # 4. 消息
+        if list_node is None and not has_bubbles:
+            # 树很大但聊天区里既没消息列表也没气泡。实测两种原因，处理方式完全不同：
+            #   · QQ 没带 --force-renderer-accessibility 启动 → 聊天内容根本不在无障碍树里
+            #     （实测：不带参数只有壳，没有 ml-root / func-bar-* 这些 id）
+            #   · 没打开会话 / 会话还在加载
+            self._note_once("no-list", self._empty_reason(nodes))
+            return
         turns = build_turns(nodes, self.sel, pane_left=pane_left, list_node=list_node)
         if not turns:
             self._note_once("no-bubbles",
@@ -325,6 +392,7 @@ if __name__ == "__main__":
                 Ctrl("TextControl", (900, 280, 1200, 310), cls="chat-header__contact-name",
                      name=session),
                 *bubble_group,
+                Ctrl("GroupControl", (852, 916, 1218, 957), aid="func-bar-shortcuts-left"),
                 Ctrl("EditControl", (900, 1000, 2000, 1080), cls="qq-msg-editor"),
             ]),
         ])
@@ -382,15 +450,52 @@ if __name__ == "__main__":
     c2.poll(emit)
     assert any(e[0] == "status" and "--force-renderer-accessibility" in e[1] for e in events), events
 
-    # 有树但没有类名 → 提示类名对不上
+    # 头部读不到（但消息在）→ 不发 lines，避免把不同会话的消息混在一起
+    state["root"] = Ctrl("PaneControl", (450, 210, 2110, 1170), kids=[
+        Ctrl("GroupControl", (520, 260, 833, 1165)),
+        Ctrl("GroupControl", (833, 260, 2105, 1165), kids=[
+            Ctrl("GroupControl", (832, 325, 1880, 907), aid="ml-root", kids=[
+                Ctrl("TextControl", (900, 400, 1300, 430), cls="", name="对方说的一句"),
+            ]),
+            Ctrl("GroupControl", (852, 916, 1218, 957), aid="func-bar-shortcuts-left"),
+        ]),
+    ])
+    events.clear()
+    c8 = UiaQqntCollector(1234, emit, selectors=Selectors(), read_interval=0)
+    c8._is_foreground = lambda: True
+    c8._window_origin = lambda: (0, 0)
+    c8.start(); events.clear()
+    c8.poll(emit)
+    kinds8 = [e[0] for e in events]
+    assert "lines" not in kinds8, kinds8
+    assert any(e[0] == "status" and "读不到会话名" in e[1] for e in events), events
+
+    # 有树但聊天区里没消息列表也没气泡 → 提示先点开会话 / 结构可能变了
+    state["root"] = Ctrl("PaneControl", (450, 210, 2110, 1170), kids=[
+        Ctrl("GroupControl", (520, 260, 833, 1165)),
+        Ctrl("GroupControl", (833, 260, 2105, 1165), kids=[
+            Ctrl("TextControl", (860, 280, 1100, 305), cls="", name="某个群名"),
+        ] + [Ctrl("GroupControl", (520 + i, 400 + i, 700 + i, 430 + i)) for i in range(45)]),
+    ])
+    events.clear()
+    c7 = UiaQqntCollector(1234, emit, selectors=Selectors(), read_interval=0)
+    c7._a11y_flag_on = staticmethod(lambda: False)
+    c7._is_foreground = lambda: True
+    c7._window_origin = lambda: (0, 0)
+    c7.start()
+    c7.poll(emit)
+    assert any(e[0] == "status" and "--force-renderer-accessibility" in e[1] for e in events), events
+
+    # 有树也有 web id、但没有类名 → 提示结构可能变了
     state["root"] = tree("甲方", ())
     events.clear()
     c3 = UiaQqntCollector(1234, emit, selectors=Selectors(), read_interval=0)
+    c3._a11y_flag_on = staticmethod(lambda: True)
     c3._is_foreground = lambda: True
     c3._window_origin = lambda: (0, 0)
     c3.start()
     c3.poll(emit)
-    assert any(e[0] == "status" and "气泡" in e[1] for e in events), events
+    assert any(e[0] == "status" and "读不到消息列表/气泡" in e[1] for e in events), events
 
     # focus_policy=foreground：QQ 不在前台就跳过，且不抢焦点
     events.clear()

@@ -261,13 +261,17 @@ hf download ggml-org/Clef-Flash-GGUF Clef-Flash-Q8_0.gguf --local-dir D:\AI_Tool
 
 ### QQ NT 怎么用
 
-1. **QQ 必须处于活动状态**（或允许读取时短暂置前）——QQ 只对前台窗口构建完整无障碍树。
-   设置页「QQ NT（UIA 读取）」卡片里选：*允许读取时短暂置前（默认）* 或 *只在 QQ 已在前台时读取*。
-2. 如果树一直是空的（只有十来个控件），用 `--force-renderer-accessibility` 启动 QQ 再试
-   （无 GPU 设备尤其需要）。采集器会在状态栏直接提示这一点。
-3. 选择器来自社区实测（`qq-msg-editor` / `chat-header__contact-name` / `container--self`），
-   QQ 大版本改类名时可在 `config.json` 里用 `qq_selectors` 覆盖；认不出时只报可诊断的提示，
-   **不会退回 OCR**。
+1. **必须带 `--force-renderer-accessibility` 启动 QQ**（不带的话它的聊天内容根本不在无障碍树里，
+   什么都读不到）。最省事：双击 `scripts\restart-qq-with-a11y.bat`——它会关掉 QQ 再带开关重新启动
+   （**未发送的草稿会丢**）。手动等价于 `QQ.exe --force-renderer-accessibility`。
+   采集器会查 QQ 进程命令行确认这一点，没开就直接提示你。
+2. **QQ 必须处于活动状态**（或允许读取时短暂置前）。设置页「QQ NT（UIA 读取）」卡片里选：
+   *允许读取时短暂置前（默认，人正在打字时不抢）* 或 *只在 QQ 已在前台时读取*。
+3. **现在单聊可用，群聊不可靠**：这个 QQ 版本不暴露 CSS 类名，只用结构 id + 几何，
+   单聊实测能正确读出消息和己方/对方；群聊的消息文本能读到、但无法可靠地归到具体某条
+   消息/发言人上。细节和实测数据见 [docs/QQNT.md](docs/QQNT.md)。
+4. 认不出时只报可诊断的提示（例如“先点开一个会话”“QQ 没带无障碍开关启动”），
+   **不会退回 OCR**，也不会静默读错。
 
 离线自测（不装 uiautomation、不开窗口）：
 
