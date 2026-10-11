@@ -22,7 +22,8 @@ from app.fill import fill, fill_rect
 from app.overlay import Overlay
 from app.version import VERSION
 from core import providers
-from core.engine import analyze
+from core.engine import analyze, analyze_group
+from core.questions import group_speakers
 from app.i18n import T
 
 # {会话名: {history, result, rev, target, senders}}：每个会话各自的上下文、上次结果和版本号，互不串味
@@ -38,7 +39,9 @@ update_result = queue.Queue()  # 独立小队列，别跟 results 的 (kind, r, 
 
 def chat_of(title):
     return chats.setdefault(title, {"history": deque(maxlen=60), "result": None, "rev": 0,
-                                    "target": None, "senders": []})
+                                    "target": None, "senders": [],
+                                    "speakers": {},    # 群聊：发言人名 → 已回来的判断
+                                    "pending_names": []})  # 这一轮要判断那几个人
 
 
 def target_of(title):
@@ -129,17 +132,28 @@ def _judge_only(msgs):
     return settings.group_judge_only() and _is_group_msgs(msgs)
 
 
+def _plan(msgs):
+    """这一轮怎么分析 → (只要判断?, 按发言人分开判断?)。
+
+    按发言人分开时必然不起草：那是给「群里多话题」用的，一个人一张判断卡，没有「下一句」。
+    所以开了按发言人，就等于不开起草，两者不会打架。"""
+    group = _is_group_msgs(msgs)
+    per_speaker = settings.group_per_speaker() and group
+    return (settings.group_judge_only() and group) or per_speaker, per_speaker
+
+
 def analyze_bg(msgs, title, revision, reply_to=None):
     """后台线程只跑网络/推理，结果丢队列；UI 只在主线程的 tick 里动（Qt 不能跨线程碰）。
 
     本地模式先让 local_server 把 llama-server 拉起来（首次要读几 GB 权重，会阻塞这里几十秒，
     但这是后台线程，界面不卡）；远程模式直接用设置里的地址。
     群聊只判断时**不加载起草模型**：省一次几 GB 的读盘和一份显存。
+    群聊按发言人判断时：每路回来就立刻丢一条 "speaker" 上屏（哪路先回先看到哪张卡）。
     """
     try:
         from app import local_server
 
-        judge_only = _judge_only(msgs)
+        judge_only, per_speaker = _plan(msgs)
         mgr = local_server.manager()
         jev_base = None
         draft_base = settings.draft_base_url() or None
@@ -154,18 +168,22 @@ def analyze_bg(msgs, title, revision, reply_to=None):
             picked = [m[3] for m in msgs[-settings.context():]
                       if len(m) > 3 and m[3] and m[0] == "her"]
             files = picked[-2:] or None
-        results.put(("ok", analyze(msgs, settings.relationship(), context=settings.context(),
-                                   model=settings.draft_model() or None,
-                                   provider=settings.draft_provider(),
-                                   base_url=draft_base,
-                                   reply_to=reply_to, style=settings.style(),
-                                   thinking=settings.thinking(),
-                                   jev_provider=settings.jev_provider(),
-                                   jev_model=settings.jev_model() or None,
-                                   jev_base_url=jev_base,
-                                   group_judge_only=judge_only,
-                                   files=files),
-                     title, revision))
+        shared = dict(model=settings.draft_model() or None,
+                      provider=settings.draft_provider(), base_url=draft_base,
+                      style=settings.style(), thinking=settings.thinking(),
+                      jev_provider=settings.jev_provider(),
+                      jev_model=settings.jev_model() or None,
+                      jev_base_url=jev_base, files=files)
+        if per_speaker:
+            got = analyze_group(msgs, settings.relationship(), context=settings.context(),
+                                workers=settings.group_speaker_workers(),
+                                max_speakers=settings.group_speaker_max(),                                on_result=lambda item: results.put(("speaker", item, title,
+                                                                    revision)),
+                                **shared)
+        else:
+            got = analyze(msgs, settings.relationship(), context=settings.context(),
+                          reply_to=reply_to, group_judge_only=judge_only, **shared)
+        results.put(("ok", got, title, revision))
     except Exception as e:
         results.put(("err", f"{T('分析失败: ')}{e}", title, revision))
 
@@ -201,19 +219,30 @@ def start_analyze(title, msgs):
     if not settings.has_jev_key():
         ov.set_status("请先在设置中配置模型", "warning")
         return
-    judge_only = _judge_only(msgs)
+    judge_only, per_speaker = _plan(msgs)
     if not judge_only and not settings.has_llm_key():
         ov.set_status(lambda name=settings.draft_provider_name():
                       f"{T('起草来源 ')}{name}{T(' 没填密钥，去设置里补上')}", "warning")
         return
     state["busy"] = True
     ov.set_busy(True)
-    if judge_only:
+    chat = chat_of(title)                       # 这里在主线程（drain/tick 里调的），动 chats 安全
+    if per_speaker:
+        chat["pending_names"] = group_speakers(msgs, keep=settings.context(),
+                                               limit=settings.group_speaker_max())
+        chat["speakers"] = {}
+        if title == ov.current_chat():          # 先把卡片位置上屏，回来一路填一路
+            ov.show_group(chat["pending_names"], {})
+        ov.set_status(T("群聊按发言人分别判断（不起草），谁先回来先看谁"))
+    elif judge_only:
+        chat["pending_names"] = []
         ov.set_status(T("群聊只给判断参考，不起草候选回复"))
-    elif _is_local("jev") or _is_local("draft"):
-        ov.set_status(T("本地模型推理中（首次要先加载权重，可能要几十秒）"))
+    else:
+        chat["pending_names"] = []
+        if _is_local("jev") or _is_local("draft"):
+            ov.set_status(T("本地模型推理中（首次要先加载权重，可能要几十秒）"))
     reply_to = target_of(title) if settings.reply_target() else None  # 开关关着就是今天的行为
-    threading.Thread(target=analyze_bg, args=(msgs, title, chat_of(title)["rev"], reply_to),
+    threading.Thread(target=analyze_bg, args=(msgs, title, chat["rev"], reply_to),
                      daemon=True).start()
 
 
@@ -255,6 +284,8 @@ def drain():
             chat["history"].clear()
             chat["senders"].clear()
             chat["result"] = None
+            chat["speakers"] = {}
+            chat["pending_names"] = []
             chat["rev"] += 1                    # 在跑的分析作废（旧会话的结果不能贴到新会话上）
             if msg[1] == ov.current_chat():
                 ov.invalidate_replies()
@@ -293,8 +324,6 @@ def drain():
         state["area"] = area
         chat = chat_of(title)
         chat["rev"] += 1  # 这个会话有新消息了，它在跑的分析作废
-        if title == ov.current_chat():  # 看的是别的会话就别把人家的候选划掉
-            ov.invalidate_replies()
         for item in new:
             who, name, text = item[0], item[1], item[2]
             media = item[3] if len(item) > 3 else None      # (mime, bytes)，给多模态判断用
@@ -304,6 +333,11 @@ def drain():
                 if name in chat["senders"]:
                     chat["senders"].remove(name)
                 chat["senders"].insert(0, name)
+        # 看的是别的会话就别把人家的候选划掉。群聊按发言人的判断卡不在这里清：
+        # 它是「对别人的判断」，我自己插一句并不使别人的判断失效——清了反而每轮闪一下，
+        # 下一轮分析（start_analyze）会把卡片整体换掉。
+        if title == ov.current_chat() and not _plan(list(chat["history"]))[1]:
+            ov.invalidate_replies()
         ov.set_targets(title, chat["senders"], target_of(title))  # 显不显示这一行由悬浮窗按开关决定
         if new[-1][0] == "her":  # 只有对方最新说话才值得分析
             msgs = list(chat["history"])
@@ -329,6 +363,14 @@ def tick():
             if kind == "note":  # 预热/状态的提示，不碰 busy、不参与会话版本号比对
                 ov.set_status(r)
                 continue
+            if kind == "speaker":  # 群聊某一路回来了：填卡但不结束这一轮（结束由后面的 ok/err 负责）
+                chat = chat_of(title)
+                if revision != chat["rev"]:
+                    continue      # 这一路过期了（会话又说话了/切走了）
+                chat["speakers"] = {**(chat.get("speakers") or {}), r["name"]: r}
+                if title == ov.current_chat():
+                    ov.show_group(chat["pending_names"], chat["speakers"])
+                continue
             state["busy"] = False
             if state["rerun"]:  # 分析期间又来了新消息，接着跑最新的
                 (t, msgs), state["rerun"] = state["rerun"], None
@@ -339,11 +381,13 @@ def tick():
                 continue
             if kind == "ok":
                 chat_of(title)["result"] = r  # 先存着；正看着这个会话才立刻贴上去
+                chat_of(title)["pending_names"] = []
                 if title == ov.current_chat():
                     ov.show(r)
                 else:
                     ov.set_busy(False)
             else:
+                chat_of(title)["pending_names"] = []
                 ov.set_busy(False)
                 ov.set_status("生成失败，请检查网络和服务设置；新消息到来后会重试。", "error")
                 ov.log(r)

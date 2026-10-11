@@ -211,6 +211,29 @@ def group_judge_only() -> bool:
     return bool(_read("group_judge_only", True))
 
 
+def group_per_speaker() -> bool:
+    """群聊按发言人分开判断（默认开）。
+
+    开着：谁最近说过话，就给谁单独做一份判断（带他自己的尾句当上下文），并发跑、哪路先回先上屏；
+    关掉：像从前那样把整个群当一段对话判断一次（多人多话题时会串味）。"""
+    return bool(_read("group_per_speaker", True))
+
+
+def group_speaker_max() -> int:
+    """群聊一次最多给几个人做判断（默认 4）。
+
+    群消息一刷可能就是十几个人，每个都发一路判断既慢又没必要；只给「最近说过话的」前 N 个做。"""
+    return _int("group_speaker_max", 4, 1, 12)
+
+
+def group_speaker_workers() -> int:
+    """群聊按发言人判断时最多几路并发（默认 3）。
+
+    注意：本地 clef 服务在服务端串行（试过 -np>1，对 /v1/systemone 无效，加速比 1.00x），
+    所以调大它只让「哪路先回先上屏」更顺，不会让总时长变短；真并行得多开 clef 实例。"""
+    return _int("group_speaker_workers", 3, 1, 8)
+
+
 def qq_backfill_messages() -> int:
     """切到某个会话后，自动往上翻、最多补齐多少条历史消息。0 = 只读当前可见的。默认 30。
 
@@ -296,6 +319,7 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
          local_draft_model_text: str | None = None, local_autostart_on: bool | None = None,
          local_idle_unload_on: bool | None = None, local_idle_seconds_n: int | None = None,
          qq_focus_policy_text: str | None = None, group_judge_only_on: bool | None = None,
+         group_per_speaker_on: bool | None = None,
          local_clef_mmproj_text: str | None = None) -> None:
     """每个参数为空/None = 保留当前值。两把 key 写进程环境 + HKCU\\Environment，不写任何文件。"""
     jev = jev_provider_text if jev_provider_text in JEV_PROVIDERS else jev_provider()
@@ -338,6 +362,7 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
                             else (qq_focus_policy_text if qq_focus_policy_text in ("steal", "foreground")
                                   else qq_focus_policy())),
         "group_judge_only": flag(group_judge_only_on, group_judge_only),
+        "group_per_speaker": flag(group_per_speaker_on, group_per_speaker),
         "local_clef_mmproj": keep(local_clef_mmproj_text, "local_clef_mmproj"),
     }
     with open(_CONFIG, "w", encoding="utf-8") as f:

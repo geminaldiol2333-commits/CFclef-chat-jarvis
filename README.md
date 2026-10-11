@@ -222,6 +222,8 @@ hf download ggml-org/Clef-Flash-GGUF Clef-Flash-Q8_0.gguf --local-dir D:\AI_Tool
 - 对方来一条消息 → 悬浮窗几秒后给判断摘要 + 三条候选（带 clef-flash 给的胜出概率）。
 - 点「填入」→ 文字进输入框 → **你自己看一眼、改一改、按发送**。程序永远不碰发送。
 - 你切到哪个会话，悬浮窗就跟到哪个；群聊会带发言人名。
+- **群聊按发言人分别判断**：群里最近说过话的几个人（默认最多 4 个）各得一张判断卡，并发跑、
+  谁先回来谁先上屏。群里**不起草**候选回复——十几个人同时在聊几件不相关的事，一条「下一句」没有意义。
 - 暂时不想让它读聊天：标题栏开关拨到「已暂停」。
 
 **怎么触发模型调用**：只有对方来新消息（或你在群里换了回复对象）才调一次。静默期零调用——
@@ -250,6 +252,11 @@ hf download ggml-org/Clef-Flash-GGUF Clef-Flash-Q8_0.gguf --local-dir D:\AI_Tool
 | `local_clef_mmproj` | `""` | clef 的多模态投影器（mmproj）路径；填了判断模型才能看图 |
 | `perceive_media` | 默认跟随 mmproj | 要不要把非文字消息（图片/表情包）的像素喂给判断模型 |
 | `group_judge_only` | `true` | 群聊只给判断、不起草候选 |
+| `group_per_speaker` | `true` | 群聊按发言人**分别**判断（一人一张卡），而不是把整个群当一段 |
+| `group_speaker_workers` | `3` | 按发言人判断时最多几路并发（1–8）；本地服务端串行，调大只影响「谁先上屏」 |
+| `group_speaker_max` | `4` | 一次最多给几个人做判断（1–12），只挑最近说过话的 |
+| `qq_backfill_messages` | `30` | 切会话后自动往上翻、最多补齐多少条历史 |
+| `qq_backfill_scrolls` | `8` | 回填时最多往上滚几格（每格 3 个滚轮刻度） |
 
 ## 支持的聊天软件
 

@@ -249,6 +249,34 @@ def guidance_text(answers: dict) -> str:
     return "判断参考（Jev 给的，起草要顺着它写，但口吻仍按我的）：\n" + "\n".join(lines)
 
 
+def group_speakers(messages: list, keep: int = 10, limit: int = 4) -> list[str]:
+    """群里最近说过话的人，去重、最近的排前面，最多 limit 个。
+
+    群聊判断是按人并发跑的（core.engine.analyze_group）：群里十几个人可能在聊三四件不相关的事，
+    一条「下一句」没有意义，但「对张三这句话我该怎么接」是有意义的。
+    只取最近 keep 条里出现过的人，避免给早就退了话题的人做判断。
+    """
+    seen: list[str] = []
+    for item in reversed(list(messages)[-max(1, keep):]):
+        name = item[2] if len(item) > 2 else None
+        if name and name not in seen:
+            seen.append(name)
+    return seen[:max(1, limit)]
+
+
+def up_to_speaker(messages: list, name: str) -> list:
+    """把历史截到某个人说的最后一句话为止（含）。
+
+    判断是「针对他这句」的：他之后别人的话不该算进这一路的上下文，否则并发出去的两路判断
+    看到的其实是同一段结尾，按发言人拆就没意义了。没找到这个人就原样返回。
+    """
+    items = list(messages)
+    for i in range(len(items) - 1, -1, -1):
+        if len(items[i]) > 2 and items[i][2] == name:
+            return items[:i + 1]
+    return items
+
+
 def build_state(messages: list, relationship: str, keep: int = 10,
                 reply_to: str | None = None) -> dict:
     """messages: (from, text) / (from, text, name) / dict（name 可选）。from 只认 her/me。

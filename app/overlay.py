@@ -206,6 +206,52 @@ class _ReplyCard(_Surface):
         self.fillButton.setMinimumWidth(80 if compact else 100)
 
 
+class _SpeakerCard(_Surface):
+    """群聊里给某个发言人做的判断卡（群里不起草，所以没有「填入」按钮）。
+
+    每个人一张：名字 + 建议 + 可能意图 + 紧张度。哪路先回来先上屏，没回来的先说「判断中」。
+    """
+
+    def __init__(self, owner, name, item=None, error=""):
+        super().__init__()
+        box = QVBoxLayout(self)
+        self.box = box
+        box.setSpacing(6)
+        top = QHBoxLayout()
+        top.addWidget(_label(name, 14, "#304c3c", True))
+        top.addStretch(1)
+        self.tension = _label("", 11)
+        self.tension.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        top.addWidget(self.tension)
+        box.addLayout(top)
+        if error:
+            self.summary = _label(T("判断失败") + "：" + error, 12, "#b44832")
+            self.tension.hide()
+        else:
+            answers = (item or {}).get("answers") or {}
+            pending = not item
+            self.summary = _label(
+                T("正在判断…") if pending else T("建议：") + _choice(answers, "best_action"), 13)
+            self.intent = _label("" if pending else
+                                 T("可能意图 · ") + _choice(answers, "true_intent") +
+                                 "\n" + T("可能需要 · ") + _choice(answers, "she_needs"), 12, _MUTED)
+            box.addWidget(self.intent)
+            score = (answers.get("danger_level") or {}).get("score")
+            good = isinstance(score, (int, float)) and isfinite(score)
+            self.tension.setText(f"{T('紧张度')} {score:.0f}/9" if good else T("紧张度待判断"))
+            color = "#996819" if good and score >= 3 else _MUTED
+            if good and score >= 6:
+                color = "#b44832"
+            qss = f"BodyLabel {{ color: {color}; background: transparent; }}"
+            setCustomStyleSheet(self.tension, qss, qss)
+        box.addWidget(self.summary)
+        self.set_compact(owner._compact)
+        bind(self, T("在群里对每个人的判断，只给参考，不起草回复。"), "setToolTip")
+
+    def set_compact(self, compact):
+        self.box.setContentsMargins(12, 8, 12, 8) if compact else self.box.setContentsMargins(16, 12, 16, 12)
+
+
 class Overlay:
     def __init__(self, on_fill, on_toggle_capture=None, on_target_change=None, result_of=None,
                  on_toggle_debug=None):
@@ -222,6 +268,7 @@ class Overlay:
         self.result_of = result_of
         self.cands = []
         self.cards = []
+        self.speakerCards = []          # 群聊按发言人的判断卡（和候选卡共用一个盒子，互相不会同时在）
         self._busy = False
         self._current = False
         self._compact = None  # 断点模式：None 保证 _relayout 第一次调用必定生效
@@ -346,13 +393,14 @@ class Overlay:
         margins = (12, 8, 12, 12) if compact else (20, 8, 20, 12)
         for layout in self._pageLayouts:
             layout.setContentsMargins(*margins)
-        for card in self.cards:
+        for card in self.cards + self.speakerCards:
             card.set_compact(compact)
 
     def _build_home(self):
         self.home, body = self._scroll_page()
         heading = QHBoxLayout()
-        heading.addWidget(_tlabel("回复建议", 23, "#24382d", True), 1)
+        self.headTitle = _tlabel("回复建议", 23, "#24382d", True)
+        heading.addWidget(self.headTitle, 1)
         self.updated = _label("", 11, _MUTED)
         self.updated.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         heading.addWidget(self.updated)
@@ -1178,7 +1226,6 @@ class Overlay:
             bind(self.updated, "上次建议", "setText")
         for card in self.cards:
             card.set_available(False)
-
     def set_status(self, text, kind="idle"):
         colors = {"idle": _MUTED, "busy": _GREEN, "success": _GREEN,
                   "warning": "#93611d", "error": "#b44832"}
@@ -1347,6 +1394,7 @@ class Overlay:
             self.insight.hide()
             self.referenceNote.hide()
             self.empty.show()
+            bind(self.headTitle, T("回复建议"), "setText")   # 群聊判断看过的，回单聊要改回来
             bind(self.updated, "", "setText")
             self._empty_text()
         if self._shown != self._chat:
@@ -1357,7 +1405,15 @@ class Overlay:
         """按推荐顺序展示，按钮始终绑定 candidates 的原始索引。
 
         result["mode"] == "judge_only" 时没有候选（群聊只判断）：只展示判断摘要，
-        把空态卡藏起来，并说明为什么不起草。"""
+        把空态卡藏起来，并说明为什么不起草。
+        result["mode"] == "group" 时是按发言人的并发判断：一人一张卡，没有候选。"""
+        if result.get("mode") == "group":
+            rows = result.get("speakers") or []
+            bind(self.headTitle, T("群聊判断"), "setText")
+            self.set_busy(False)
+            self.show_group([r["name"] for r in rows], {r["name"]: r for r in rows})
+            return
+        bind(self.headTitle, T("回复建议"), "setText")
         judge_only = result.get("mode") == "judge_only"
         self.cands = result["candidates"]
         self.set_busy(False)
@@ -1405,11 +1461,42 @@ class Overlay:
             self.set_status("未生成可用回复，请等待下一条新消息。", "error")
 
     def _clear_cards(self):
-        for card in self.cards:
+        """清掉候选卡和群聊判断卡（两者共用 replyBox，不会同时存在）。"""
+        for card in self.cards + self.speakerCards:
             self.replyBox.removeWidget(card)
             card.hide()
             card.deleteLater()
         self.cards = []
+        self.speakerCards = []
+
+    def show_group(self, names, results=None):
+        """群聊：一人一张判断卡。names = 这一轮要判断的人（最近说话的排前），results = 已回来的。
+
+        哪路先回就先把它那张填上（其余还是「正在判断…」），所以这个函数会被反复调；
+        每次重建：一共就几张卡，重建比精确更新好写也好读。
+        """
+        results = results or {}
+        self.cands = []
+        self._clear_cards()
+        for name in names:
+            item = results.get(name)
+            card = _SpeakerCard(self, name, item=item,
+                                error=(item or {}).get("error", "") if item else "")
+            self.replyBox.addWidget(card)
+            self.speakerCards.append(card)
+        bind(self.headTitle, T("群聊判断"), "setText")
+        self.insight.hide()                 # 整体判断那块对群聊不适用，每张卡自带判断
+        self.referenceNote.setVisible(bool(names) and not self._compact)
+        self.empty.setVisible(not names)
+        self._current = False               # 群里没有「填入」这回事
+        bind(self.updated, lambda: datetime.now().strftime("%H:%M") + " " + T("更新"))
+        if names:
+            done = sum(1 for n in names if results.get(n))
+            self.set_status(lambda: T("群聊按发言人分别判断（不起草）：").format()
+                            + f"{done}/{len(names)}" + T(" 已回"),
+                            "success" if done == len(names) else "busy")
+        else:
+            self.set_status("群里还没有带名字的消息", "idle")
 
     def after(self, ms, fn):
         QTimer.singleShot(ms, fn)

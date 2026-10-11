@@ -16,7 +16,7 @@ from unittest.mock import patch
 from app import settings
 
 
-_STATES = ("ready", "waiting", "loading", "error", "setup", "settings", "paused", "debug")
+_STATES = ("ready", "waiting", "loading", "error", "setup", "settings", "paused", "debug", "group")
 
 # 调试视图预览用的真微信截图（只读进内存，不改不存）；没有就退一张空画面
 _FRAME = Path("/private/tmp/claude-501/-Users-lpitiless-Documents-project-wechatjev"
@@ -98,6 +98,26 @@ _RESULT = {
     },
     "usage": {},
     "reply_to": "阿杰",  # 跟 _SENDERS[0] 一致，让「回复给 …」那行在演示里看得见
+}
+
+
+# 群聊按发言人的判断：最后一个故意不给（演示「正在判断…」那张占了位但还没回来）
+_GROUP_SPEAKERS = ["王五", "张三", "李四"]
+_GROUP_RESULT = {
+    "mode": "group",
+    "speakers": [
+        {"name": "王五", "error": "", "usage": {},
+         "answers": {"true_intent": {"type": "choice", "choice": "casual_chat"},
+                     "best_action": {"type": "choice", "choice": "acknowledge"},
+                     "she_needs": {"type": "choice", "choice": "care"},
+                     "danger_level": {"type": "score", "score": 1}}},
+        {"name": "张三", "error": "", "usage": {},
+         "answers": {"true_intent": {"type": "choice", "choice": "request_action"},
+                     "best_action": {"type": "choice", "choice": "check_history"},
+                     "she_needs": {"type": "choice", "choice": "action"},
+                     "danger_level": {"type": "score", "score": 4}}},
+    ],
+    "candidates": [], "best_index": 0, "best_reply": "", "scores": [], "answers": {}, "usage": {},
 }
 
 
@@ -242,6 +262,13 @@ def main() -> int:
         elif args.state == "setup":
             ov.set_status("演示模式：请填写示例密钥，设置仅保存在本次预览内。", kind="warning")
             ov.open_settings()
+        elif args.state == "group":
+            for chat, who, text, name, timestamp in _MESSAGES:
+                ov.log_message(who, text, name, timestamp=timestamp, chat=chat)
+            ov.set_targets(_GROUP, _SENDERS, _SENDERS[0])
+            ov.set_chat(_CHAT)
+            ov.show_group(_GROUP_SPEAKERS, {r["name"]: r for r in _GROUP_RESULT["speakers"]})
+            ov.set_status("演示模式：群聊按发言人分别判断，不起草。", kind="busy")
         elif args.state == "waiting":
             ov.set_status("演示模式：等待对方的新消息；当前未连接微信。")
         else:

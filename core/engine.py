@@ -5,14 +5,18 @@
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 try:
     from .draft import draft_candidates
     from .jev_client import JevError, ask
-    from .questions import JUDGE_QUESTIONS, build_rank_question, build_state, guidance_text
+    from .questions import (JUDGE_QUESTIONS, build_rank_question, build_state, group_speakers,
+                            guidance_text, up_to_speaker)
 except ImportError:
     from draft import draft_candidates
     from jev_client import JevError, ask
-    from questions import JUDGE_QUESTIONS, build_rank_question, build_state, guidance_text
+    from questions import (JUDGE_QUESTIONS, build_rank_question, build_state, group_speakers,
+                           guidance_text, up_to_speaker)
 
 _REPLY_IDX = {"reply_a": 0, "reply_b": 1, "reply_c": 2}
 
@@ -21,6 +25,56 @@ def _add_usage(total: dict, one: dict | None) -> None:
     """两次 Jev 调用的 usage 相加（tokens、cost）；非数字的字段后来的盖掉前面的。"""
     for k, v in (one or {}).items():
         total[k] = total.get(k, 0) + v if isinstance(v, (int, float)) else v
+
+
+def analyze_group(messages: list, relationship: str, *, context: int = 10, workers: int = 3,
+                  on_result=None, base_urls: list[str] | None = None,
+                  max_speakers: int = 4, **kw) -> dict:
+    """群聊：**按发言人并发**做判断，不起草也不排序。
+
+    为什么按人拆：群里十几个人可能在聊三四件正交的事，一条「下一句说什么」是伪命题；
+    但「针对张三这句我该怎么接」是有意义的，而且拆开后每路都拿自己的尾句当上下文，
+    不会互相污染（见 questions.up_to_speaker）。**不做话题聚类**：那是又一次模型调用，
+    还可能分错，按发言人拆是机械的、不会错的近似。
+
+    并发只是把 N 路请求同时发出去、谁先回谁先上屏——本地 clef 服务在服务端串行（实测 -np>1
+    对 /v1/systemone 无效，加速比 1.00x），所以别指望总时长变短；真并行要 base_urls 给多份
+    实例（将来多开 clef 时把地址列表传进来就会轮流分配到不同实例）。
+
+    on_result(单路结果 dict) 在**池线程**里回调，只允许往队列里塞东西（不能碰 Qt/共享字典）。
+    base_urls 给了就按顺序轮流给每路用（None 长度 == 1 时就是同一个地址）。
+    返回 {mode: "group", speakers: [{name, answers, usage, error}...], ...}，顺序 = 最近说话的排前。
+    """
+    names = group_speakers(messages, keep=context, limit=max_speakers)
+    if not names:                                   # 群里一条带名字的都没有：退回整段判断
+        one = analyze(messages, relationship, context=context, group_judge_only=True, **kw)
+        return {**one, "speakers": []}
+    urls = [u for u in (base_urls or []) if u]
+    usage: dict = {}
+
+    def one_route(i: int, name: str) -> dict:
+        route = dict(kw)
+        if urls:
+            route["jev_base_url"] = urls[i % len(urls)]
+        try:
+            got = analyze(up_to_speaker(messages, name), relationship, context=context,
+                          reply_to=name, group_judge_only=True, **route)
+            item = {"name": name, "answers": got.get("answers") or {},
+                    "usage": got.get("usage") or {}, "error": ""}
+        except Exception as exc:                    # 一路挂了不影响其他路
+            item = {"name": name, "answers": {}, "usage": {},
+                    "error": f"{type(exc).__name__}: {exc}"}
+        if on_result is not None:
+            on_result(item)
+        return item
+
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(names))),
+                            thread_name_prefix="clef-group") as pool:
+        items = list(pool.map(lambda pair: one_route(*pair), list(enumerate(names))))
+    for item in items:
+        _add_usage(usage, item.get("usage"))
+    return {"mode": "group", "speakers": items, "candidates": [], "best_index": 0,
+            "best_reply": "", "scores": [], "answers": {}, "usage": usage}
 
 
 def analyze(messages: list, relationship: str, model: str | None = None,
@@ -157,4 +211,72 @@ if __name__ == "__main__":
          patch("__main__.draft_candidates", return_value=["a", "b", "c"]):
         r2 = analyze([("her", "hello")], "friends", group_judge_only=True)
     assert r2["mode"] == "draft" and r2["candidates"] == ["a", "b", "c"]
+
+    # ---- 群聊按发言人并发 ----
+    import threading
+    import time
+
+    try:
+        from .questions import group_speakers, up_to_speaker
+    except ImportError:
+        from questions import group_speakers, up_to_speaker
+
+    hist = [("her", "甲一", "张三"), ("her", "乙一", "李四"), ("me", "嗯"),
+            ("her", "甲二", "张三"), ("her", "丙一", "王五")]
+    assert group_speakers(hist, keep=10) == ["王五", "张三", "李四"]
+    assert group_speakers(hist, keep=2) == ["王五", "张三"]           # 只看最近两条
+    assert group_speakers(hist, keep=10, limit=2) == ["王五", "张三"]  # 人数上限
+    assert up_to_speaker(hist, "张三") == hist[:4]                     # 截到他最后一句话
+    assert len(up_to_speaker(hist, "李四")) == 2
+    assert up_to_speaker(hist, "查无此人") == hist
+
+    seen_routes, inflight, peak = [], [0], [0]
+    lock = threading.Lock()
+
+    def fake_analyze(msgs, rel, **k):
+        with lock:
+            inflight[0] += 1
+            peak[0] = max(peak[0], inflight[0])
+        seen_routes.append((msgs[-1][2], k.get("reply_to"), k.get("group_judge_only"),
+                            k.get("jev_base_url")))
+        time.sleep(0.2)                              # 装成一次模型调用
+        with lock:
+            inflight[0] -= 1
+        return {"answers": {"danger_level": {"score": 1}}, "usage": {"cost": 0.1},
+                "mode": "judge_only", "candidates": []}
+
+    streamed = []
+    with patch("__main__.analyze", fake_analyze):
+        t0 = time.time()
+        got = analyze_group(hist, "friends", context=10, workers=3, on_result=streamed.append)
+        wall = time.time() - t0
+    assert got["mode"] == "group" and got["candidates"] == []
+    assert [s["name"] for s in got["speakers"]] == ["王五", "张三", "李四"]   # 最近说话的排前
+    assert peak[0] >= 2, f"没有并发跑（峰值 {peak[0]}）"
+    assert wall < 0.45, f"3 路 0.2s 的活跑了 {wall:.2f}s，像是串行"
+    assert len(streamed) == 3, streamed
+    # 每路各看自己那句（尾句属于自己，reply_to 也是自己），不然按人拆就白拆了
+    assert sorted(seen_routes) == sorted([("王五", "王五", True, None),
+                                         ("张三", "张三", True, None),
+                                         ("李四", "李四", True, None)]), seen_routes
+    assert all(s["answers"]["danger_level"]["score"] == 1 for s in got["speakers"])
+    assert round(got["usage"]["cost"], 3) == 0.3                 # 三路 usage 相加
+
+    # 多实例：给了 base_urls 就轮流分配（将来多开 clef 时靠这个真并行）
+    seen_routes.clear()
+    with patch("__main__.analyze", fake_analyze):
+        analyze_group(hist, "friends", context=10, workers=3,
+                      base_urls=["http://a", "http://b"])
+    assert sorted(r[3] for r in seen_routes) == ["http://a", "http://a", "http://b"], seen_routes
+
+    # 单路挂掉不连坐
+    def boom_once(msgs, rel, **k):
+        if k.get("reply_to") == "张三":
+            raise RuntimeError("模型挂了")
+        return {"answers": {}, "usage": {}}
+
+    with patch("__main__.analyze", boom_once):
+        got2 = analyze_group(hist, "friends", context=10, workers=3)
+    errs = {s["name"]: s["error"] for s in got2["speakers"]}
+    assert "模型挂了" in errs["张三"] and errs["李四"] == "" and errs["王五"] == "", errs
     print("engine ok")
