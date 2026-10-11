@@ -258,10 +258,14 @@ hf download ggml-org/Clef-Flash-GGUF Clef-Flash-Q8_0.gguf --local-dir D:\AI_Tool
 OCR 用 RapidOCR 的中英文模型；上游为韩文 KakaoTalk 加的 Windows.Media.Ocr 后端已经随 KakaoTalk
 适配一起移除了（历史版本见 git 记录）。
 
-**QQ NT（Windows）目前还不支持。** 调研、实测数据和阻塞点都记在 [docs/QQNT.md](docs/QQNT.md)：
-窗口很好认（`Chrome_WidgetWin_1` / 标题 `QQ`），但现有 `chat_area()` 的像素锚点在 QQ NT 上失效
-（聊天区是壁纸/渐变，不是平底色），还需要一个 QQ 专用的面板/输入框定位器。
-`probe/probe_qq_windows.py` 和 `probe/probe_qq_pane.py` 是配套的测量探针。
+**QQ NT（Windows）目前还不支持。** 调研、参考项目、实测数据和可行路线都记在
+[docs/QQNT.md](docs/QQNT.md)。结论是：现有 `chat_area()` 的像素锚点在 QQ NT 上失效
+（聊天区是壁纸/渐变，不是平底色），但 **QQ NT 的控件在 UIA 无障碍树上是完整暴露的**
+（输入框 `qq-msg-editor`、头部联系人 `chat-header__contact-name`、己方气泡标记
+`container--self`），走 UIA 能绕开像素定位、也不用 OCR。可直接参考
+[`treers2/qq-operations`](https://github.com/treers2/qq-operations) 和
+[`TheD0ubleC/QQSafeChat`](https://github.com/TheD0ubleC/QQSafeChat)（都是 MIT、都不注入）。
+`probe/probe_qq_windows.py` 和 `probe/probe_qq_pane.py` 是像素路线的测量探针。
 
 ## 故障排查
 
