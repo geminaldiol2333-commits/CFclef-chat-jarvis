@@ -210,6 +210,18 @@ def group_judge_only() -> bool:
     关掉这个开关才会像单聊那样起草——知道自己群里只有一个话题的人可以关。"""
     return bool(_read("group_judge_only", True))
 
+
+def qq_backfill_messages() -> int:
+    """切到某个会话后，自动往上翻、最多补齐多少条历史消息。0 = 只读当前可见的。默认 30。
+
+    为什么要翻：QQ 的消息列表是虚拟列表，没渲染出来的消息读不到，只读当前视图常只有几条。"""
+    return _int("qq_backfill_messages", 30, 0, 300)
+
+
+def qq_backfill_scrolls() -> int:
+    """回填时最多往上滚几次（每次 3 格）。默认 8，防止在很长的会话里一直翻。"""
+    return _int("qq_backfill_scrolls", 8, 1, 40)
+
 def _read_env(env_name: str) -> str:
     """进程环境优先；没有就读注册表并带进进程环境，之后 core/ 里按 os.environ 读就有了。"""
     v = os.environ.get(env_name, "").strip()

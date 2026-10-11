@@ -25,7 +25,7 @@ from app.collectors.base import BaseCollector, Capabilities
 from app.collectors.uia_map import (Node, build_turns, detect_mode, find_editor,
                                     find_message_list, find_session, new_turns, pane_bounds,
                                     sel_from)
-from app.textsim import similar
+# 注：不去重不用 app.textsim.similar（那是给 OCR 的模糊匹配），见下面 _exact()
 
 u32, k32 = ctypes.windll.user32, ctypes.windll.kernel32
 u32.GetWindowTextW.argtypes = [w.HWND, w.LPWSTR, ctypes.c_int]
@@ -38,6 +38,17 @@ TINY_TREE = 40           # 少于这么多节点 = 多半是「后台窗口只�
 REVIVE_WAIT = 0.8        # 等 Chromium 把无障碍树建出来（社区实测 800ms）
 READ_INTERVAL = 1.2      # 两次读树的最小间隔（秒）：读一次要几百 ms，不能每 50ms 跑一遍
 USER_ACTIVE_GRACE = 1.5  # 人在打字/动鼠标的这段时间内不去抢焦点（秒）
+WHEEL_TICKS = 3          # 回填历史时每次滚多少格
+SCROLL_SETTLE = 0.35     # 滚动后等多久让列表渲染完（虚拟列表要现渲）
+
+
+def _exact(a: str, b: str) -> bool:
+    """UIA 的文本是精确的，去重必须用全等——不能用 OCR 那套模糊匹配。
+
+    `app.textsim.similar` 是给 OCR 用的（同一段像素挪个位置会认成不同字，所以要允许 75% 相似）。
+    拿它去重 QQ 的消息会把**不同消息吃掉**：实测两条仅差一两字的短消息（“好的明天见”/“好的后天见”）
+    相似度超过 0.75，后一条就再也报不上来了。"""
+    return a == b
 
 
 class _LASTINPUTINFO(ctypes.Structure):
@@ -59,7 +70,8 @@ class UiaQqntCollector(BaseCollector):
     def __init__(self, hwnd, emit, debug_on=None, app=None, *,
                  selectors=None, focus_policy="steal",
                  read_interval=READ_INTERVAL, user_grace=USER_ACTIVE_GRACE,
-                 capture_media=False, media_max_side=1024):
+                 capture_media=False, media_max_side=1024,
+                 backfill=0, max_scrolls=8):
         super().__init__(hwnd, emit, debug_on)
         self.sel = selectors or sel_from(None)
         self.focus_policy = focus_policy or "steal"
@@ -67,6 +79,8 @@ class UiaQqntCollector(BaseCollector):
         self.user_grace = float(user_grace)
         self.capture_media = bool(capture_media)   # 要不要把图片/表情包的像素截下来（给多模态判断）
         self.media_max_side = int(media_max_side)
+        self.backfill = int(backfill)              # 切会话后自动补齐多少条历史（0 = 不补）
+        self.max_scrolls = int(max_scrolls)
         self.seen: list[tuple[str, str, str | None]] = []
         self.title = ""
         self.last_area = None
@@ -108,6 +122,96 @@ class UiaQqntCollector(BaseCollector):
 
     def alive(self) -> bool:
         return bool(u32.IsWindow(self.hwnd))
+
+    # ---------------------------------------------------------------- 读图 + 回填历史
+
+    def _scan(self):
+        """读一棵树并定位：返回 (nodes, pane_left, pane_right, list_node)。"""
+        nodes = self._read_tree()
+        tops = [n.rect for n in nodes if n.depth == 0 and n.has_geo]
+        panel = ((min(r[0] for r in tops), min(r[1] for r in tops),
+                  max(r[2] for r in tops), max(r[3] for r in tops)) if tops else (0, 0, 0, 0))
+        pane_left, pane_right = pane_bounds(nodes, panel)
+        return nodes, pane_left, pane_right, find_message_list(nodes, pane_left)
+
+    def _emit_turns(self, nodes, emit, pane_left, list_node) -> int:
+        """从一棵树里取新消息发 lines，返回这次发了几条（去重靠 self.seen）。
+
+        list_node 允许为 None：类名那条路（气泡 + container--self）不需要消息列表。"""
+        anchors: list = []
+        turns = build_turns(nodes, self.sel, pane_left=pane_left, list_node=list_node,
+                            anchors=anchors)
+        if not turns:
+            return 0
+        idx: list = []
+        fresh = new_turns(self.seen, turns, _exact, idx)
+        if not fresh or not self.title:
+            return 0
+        payload = []
+        for j, t in enumerate(fresh):
+            media = None
+            a = anchors[idx[j]] if idx[j] < len(anchors) else None
+            if self.capture_media and a is not None:
+                media = self._grab(a)
+            payload.append((t.who, t.name, t.text, media) if media
+                           else (t.who, t.name, t.text))
+        emit("lines", self.title, payload, self.last_area or (0, 0, 0, 0))
+        return len(fresh)
+
+    def _read_and_emit(self, emit) -> int:
+        nodes, pane_left, _, list_node = self._scan()
+        return self._emit_turns(nodes, emit, pane_left, list_node)
+
+    def _backfill(self, emit) -> int:
+        """切会话后自动往上翻，把历史消息补齐（默认 30 条），再滚回底部。
+
+        为什么必须翻：QQ 的消息列表是**虚拟列表**，没渲染出来的项几何全是 0，
+        只读当前视图往往只有几条（实测刚切过去只有 4 条），判断的上下文太薄。
+        翻法：先滚到顶（有上限，并且不再变多就停），再逐格往下滚——
+        每下一步读一遍并发消息，这样消息天然是**按时间顺序**补齐的，
+        最后正好回到最新处（不会把用户的视图留在半截历史里）。
+        只读不发。人在动键鼠时不去动他的滚动位置。
+        """
+        auto = self._auto
+        if auto is None or self.backfill <= 0:
+            return self._read_and_emit(emit)          # 不回填：至少把当前视图读了
+        if self._user_idle_seconds() < self.user_grace:
+            return self._read_and_emit(emit)          # 人在操作：不动滚动，只读当前视图
+        nodes, pane_left, _, list_node = self._scan()
+        if list_node is None or not list_node.has_geo:
+            return self._read_and_emit(emit)
+        sent = 0
+        cx = (list_node.rect[0] + list_node.rect[2]) // 2
+        cy = (list_node.rect[1] + list_node.rect[3]) // 2
+        try:
+            u32.SetCursorPos(cx, cy)          # 滚轮发给光标下的窗口
+        except Exception:
+            return sent
+        ups = 0
+        known: set[tuple[str, str]] = set()
+        for _ in range(max(1, self.max_scrolls)):
+            auto.WheelUp(wheelTimes=WHEEL_TICKS)
+            time.sleep(SCROLL_SETTLE)
+            ups += 1
+            nodes, pane_left, _, list_node = self._scan()
+            if list_node is None:
+                break
+            turns = build_turns(nodes, self.sel, pane_left=pane_left, list_node=list_node)
+            now = {(t.who, t.text) for t in turns}
+            # 到顶的判据是「这一滚没有带来任何新消息」，不是「可见条数不再变大」——
+            # 可见条数本来就恒等于一屏（虚拟列表就渲这么多）。
+            if not (now - known):
+                break
+            known |= now
+            if len(known) >= self.backfill:
+                break                         # 已经够多了
+        # 往下走回到最新处，边走边发（于是顺序是从旧到新）
+        for _ in range(ups):
+            auto.WheelDown(wheelTimes=WHEEL_TICKS)
+            time.sleep(SCROLL_SETTLE)
+            sent += self._read_and_emit(emit)
+        sent += self._read_and_emit(emit)     # 最后再读一次，确保最新那条也在
+        return sent
 
     # ---------------------------------------------------------------- 读树
 
@@ -321,10 +425,12 @@ class UiaQqntCollector(BaseCollector):
                 "这一拍读不到会话名（QQ 头部暂时不可读，切会话后常见）——先不读消息，"
                 "以免把不同会话的消息混在一起。")
             return
-        if name != self.title:
+        switched = name != self.title
+        if switched:
             self.title = name
             self.seen.clear()          # 换会话：去重状态跟着换（和 OCR 采集器一致）
             emit("chat", name)
+            emit("reset", name)        # 切会话要重置：让父进程把这个会话的历史清掉重读
         ox, oy = self._window_origin()
         # area：父进程只拿它当「能不能填」的护栏（QQ 靠 input 事件定位），
         # 所以直接用消息列表的矩形；不能拿全聊天区节点的并集——消息列表是虚拟列表，
@@ -359,26 +465,16 @@ class UiaQqntCollector(BaseCollector):
             #   · 没打开会话 / 会话还在加载
             self._note_once("no-list", self._empty_reason(nodes))
             return
-        anchors: list = []
-        turns = build_turns(nodes, self.sel, pane_left=pane_left, list_node=list_node,
-                            anchors=anchors)
-        if not turns:
+        if not build_turns(nodes, self.sel, pane_left=pane_left, list_node=list_node):
             self._note_once("no-bubbles",
                             "没读到消息（message-container / ml-root 都没有）——"
                             "可能这个 QQ 版本结构变了，用 probe\\probe_qq_uia.py 抓一份树来对。")
             return
-        idx: list = []
-        fresh = new_turns(self.seen, turns, similar, idx)
-        if fresh and self.title:
-            payload = []
-            for j, t in enumerate(fresh):
-                media = None
-                a = anchors[idx[j]] if idx[j] < len(anchors) else None
-                if self.capture_media and a is not None:
-                    media = self._grab(a)
-                payload.append((t.who, t.name, t.text, media) if media
-                               else (t.who, t.name, t.text))
-            emit("lines", self.title, payload, self.last_area or (0, 0, 0, 0))
+        if switched and self.backfill > 0:
+            # 切会话：先自动把历史补齐（_backfill 内部按时间顺序发 lines），做完就返回
+            self._backfill(emit)
+            return
+        self._emit_turns(nodes, emit, pane_left, list_node)
 
     def _grab(self, node) -> tuple[str, bytes] | None:
         """把媒体节点的屏幕矩形截下来 → (mime, JPEG 字节)。**只在内存里**，不落盘。
@@ -462,12 +558,12 @@ if __name__ == "__main__":
     c.start()
     c.poll(emit)
     kinds = [e[0] for e in events]
-    assert kinds == ["resumed", "chat", "area", "input", "lines"], kinds
+    assert kinds == ["resumed", "chat", "reset", "area", "input", "lines"], kinds
     assert events[1] == ("chat", "甲方"), events[1]
-    assert events[3] == ("input", (900, 1000, 2000, 1048)), events[3]   # 上 60%（点中心落在打字区）
-    _l, _t, _r, _b = events[3][1]
-    assert _t >= 1000 and _b <= 1080, events[3]                          # 仍在原框之内
-    assert events[4][2] == [("her", None, "在吗"), ("me", None, "在的")], events[4]
+    assert events[4] == ("input", (900, 1000, 2000, 1048)), events[4]   # 上 60%（点中心落在打字区）
+    _l, _t, _r, _b = events[4][1]
+    assert _t >= 1000 and _b <= 1080, events[4]                          # 仍在原框之内
+    assert events[5][2] == [("her", None, "在吗"), ("me", None, "在的")], events[5]
 
     # 同一棵树再跑一拍：不该重复上报
     n = len(events)
@@ -486,8 +582,8 @@ if __name__ == "__main__":
     state["root"] = tree("乙方", (("in", "message-container", "你好"),))
     n = len(events)
     c.poll(emit)
-    assert [e[0] for e in events[n:]] == ["chat", "lines"], events[n:]
-    assert events[n + 1][1] == "乙方"
+    assert [e[0] for e in events[n:]] == ["chat", "reset", "lines"], events[n:]
+    assert events[n][1] == "乙方" and events[n + 1][1] == "乙方"   # chat 和 reset 都带新会话名
 
     # 后台那种小树 → 提示要用 --force-renderer-accessibility
     state["root"] = Ctrl("PaneControl", (450, 210, 2110, 1170), kids=[Ctrl("GroupControl")])
@@ -567,7 +663,7 @@ if __name__ == "__main__":
     c5.poll(em2)
     first = [e[0] for e in ev2]
     c5.poll(em2)                                   # 立刻再拍：应被节流拦住
-    assert first == ["chat", "area", "input", "lines"], first
+    assert first == ["chat", "reset", "area", "input", "lines"], first
     assert [e[0] for e in ev2] == first, ev2
 
     # 抢焦点策略：人刚动过键鼠 → 不抢（不打断打字）；空闲下来 → 才抢
@@ -622,5 +718,66 @@ if __name__ == "__main__":
     lines = [e for e in ev3 if e[0] == "lines"][0][2]
     assert lines == [("her", "对方", "[图片]", ("image/jpeg", b"X"))], lines
     assert grabbed and grabbed[0].type == "ImageControl", grabbed
+
+    # 切会话 → reset + 自动回填历史（虚拟列表 + 滚轮全部用假的）
+    TOTAL, VIEW = 40, 5
+    TXT = lambda i: f"msg{i}A内容{i}B"      # 造得彼此不像，免得被“相似即同一条”的去重吃掉
+    vstate = {"lo": TOTAL - VIEW, "session": "群A"}
+    def fake_window_tree():
+        lo = max(0, min(vstate["lo"], TOTAL - VIEW))
+        kids = [Ctrl("TextControl", (1031, 237, 1084, 263), cls="", name=vstate["session"]),
+                Ctrl("GroupControl", (832, 325, 1880, 907), aid="ml-root", kids=[
+                    Ctrl("GroupControl", (830, 340 + 40 * k, 1300, 380 + 40 * k),
+                         cls="message-container", name=TXT(lo + k)) for k in range(VIEW)])]
+        return Ctrl("PaneControl", (450, 210, 2110, 1170), kids=[
+            Ctrl("GroupControl", (520, 260, 833, 1165)),
+            Ctrl("GroupControl", (832, 260, 2105, 1165), kids=kids)])
+    def as_nodes(root):
+        """把 Ctrl 假树变成采集器真正会拿到的 Node 列表（_read_tree 的返回形状）。"""
+        out: list = []
+        def walk(c, d, p):
+            for k in c.GetChildren():
+                i = len(out)
+                r = k.BoundingRectangle
+                out.append(Node(i, p, d, k.ControlTypeName, k.ClassName, k.AutomationId,
+                                (r.left, r.top, r.right, r.bottom), k.Name, len(k.Name)))
+                walk(k, d + 1, i)
+        walk(root, 0, -1)
+        return out
+    ev4: list = []
+    em4 = lambda kind, *p: ev4.append((kind,) + tuple(p))
+    c11 = UiaQqntCollector(1234, em4, selectors=Selectors(), read_interval=0,
+                           backfill=30, max_scrolls=8)
+    c11._is_foreground = lambda: True
+    c11._window_origin = lambda: (0, 0)
+    c11._user_idle_seconds = lambda: 9.0          # 假装人离开了一会儿，允许滚动
+    c11._read_tree = lambda: as_nodes(fake_window_tree())
+    fake.WheelUp = lambda wheelTimes=3: vstate.update(lo=max(0, vstate["lo"] - wheelTimes))
+    fake.WheelDown = lambda wheelTimes=3: vstate.update(lo=min(TOTAL - VIEW, vstate["lo"] + wheelTimes))
+    c11.start(); ev4.clear()
+    c11.poll(em4)
+    kinds = [e[0] for e in ev4]
+    assert kinds[:2] == ["chat", "reset"], kinds        # 首次读就是“切到这个会话”
+    assert vstate["lo"] == TOTAL - VIEW, vstate         # 回填完要回到最新处
+    allt = [x[2] for e in ev4 if e[0] == "lines" for x in e[2]]
+    assert allt and allt[-1] == TXT(TOTAL - 1), allt[-3:]      # 最后一条是最新的
+    assert allt == sorted(allt, key=lambda t: int(t.split("A")[0][3:])), allt[:6]  # 从旧到新
+
+    # 切到另一个群：必须 reset + 重新按时间顺序补齐历史
+    ev4.clear()
+    vstate["session"], vstate["lo"] = "群B", TOTAL - VIEW
+    c11._last_read = 0.0
+    c11.poll(em4)
+    kinds = [e[0] for e in ev4]
+    assert kinds[:2] == ["chat", "reset"], kinds
+    texts = []
+    for e in ev4:
+        if e[0] == "lines":
+            texts += [x[2] for x in e[2]]
+    assert len(texts) >= 25, len(texts)                      # 补齐了一大批历史（上限内）
+    num = lambda t: int(t.split("A")[0][3:])
+    assert texts == sorted(texts, key=num), texts[:8]         # 按时间顺序
+    assert texts[-1] == TXT(TOTAL - 1), texts[-3:]           # 最后回到最新那条
+    assert vstate["lo"] == TOTAL - VIEW, vstate               # 视图回到最新处
 
     print("uia_qqnt ok")

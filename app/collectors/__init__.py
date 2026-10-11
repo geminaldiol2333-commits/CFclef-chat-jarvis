@@ -35,10 +35,14 @@ def build(app, hwnd, emit, debug_on=None) -> BaseCollector:
             interval = settings.qq_poll_seconds()
             grace = settings.qq_user_grace_seconds()
             capture = settings.perceive_media()
+            backfill = settings.qq_backfill_messages()
+            scrolls = settings.qq_backfill_scrolls()
         except Exception:
             policy, selectors, interval, grace, capture = "steal", sel_from(None), 1.2, 1.5, False
+            backfill, scrolls = 0, 8
         return UiaQqntCollector(hwnd, emit, debug_on, app=app,
                                 selectors=selectors, focus_policy=policy,
                                 read_interval=interval, user_grace=grace,
-                                capture_media=capture)
+                                capture_media=capture,
+                                backfill=backfill, max_scrolls=scrolls)
     raise RuntimeError(f"未知采集引擎：{engine!r}（app/chatapps.py 里的 collector 字段）")

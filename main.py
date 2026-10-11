@@ -171,18 +171,21 @@ def analyze_bg(msgs, title, revision, reply_to=None):
 
 
 def warmup_bg():
-    """启动时后台预热本地模型（可关）。出错只提示，不弹设置页。"""
+    """启动时后台预热**判断模型**（可关）。
+
+    只预热 clef：群聊根本不用起草模型，而单聊真正需要时 analyze_bg 会自己 ensure("draft")。
+    这样常驻显存从 ~19 GB 降到 ~10 GB，第一条单聊消息多等十几秒（状态栏会写“首次要先加载权重”）。
+    出错只提示，不弹设置页。
+    """
     from app import local_server
 
-    kinds = [k for k, on in (("clef", _is_local("jev")), ("draft", _is_local("draft"))) if on]
-    if not kinds:
+    if not _is_local("jev"):
         return
     try:
         mgr = local_server.manager()
         mgr.start_reaper()
-        for kind in kinds:
-            mgr.ensure(kind)
-        results.put(("note", T("本地模型已就绪"), "", -1))
+        mgr.ensure("clef")
+        results.put(("note", T("本地判断模型已就绪"), "", -1))
     except Exception as exc:
         results.put(("note", f"{T('本地模型启动失败')}: {exc}", "", -1))
 
@@ -246,6 +249,16 @@ def drain():
         if kind == "chat":  # 微信切了会话，界面跟过去（用户正浏览别的会话时也跟，微信是准的）
             state["chat"] = msg[1]
             ov.set_chat(msg[1])
+            continue
+        if kind == "reset":  # 切了会话：把这个会话的历史清掉，下面的历史回填会重新按时间填
+            chat = chat_of(msg[1])
+            chat["history"].clear()
+            chat["senders"].clear()
+            chat["result"] = None
+            chat["rev"] += 1                    # 在跑的分析作废（旧会话的结果不能贴到新会话上）
+            if msg[1] == ov.current_chat():
+                ov.invalidate_replies()
+                ov.log(T("已切到新会话，正在读取历史消息…"))
             continue
         if kind == "debug":  # 调试视图的一帧；窗口不在就直接丢掉
             if dbg is not None:
@@ -359,8 +372,9 @@ if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本�
         child = spawn_worker()
     if settings.debug_view():  # 上次开着就直接开回来
         set_debug(True)
-    if settings.local_autostart() and (_is_local("jev") or _is_local("draft")):
-        # 后台预热本地模型：一启动就读权重，第一条消息不用等；可关（设置页「启动时预热」）
+    if settings.local_autostart() and _is_local("jev"):
+        # 后台预热判断模型：一启动就读权重，第一条消息不用等；可关（设置页「启动时预热」）
+        # 只预热 clef，起草模型按需加载（群聊用不上它，能省一半显存）。
         threading.Thread(target=warmup_bg, daemon=True).start()
     if not settings.has_jev_key():
         ov.set_status("请先在设置中配置模型", "warning")
