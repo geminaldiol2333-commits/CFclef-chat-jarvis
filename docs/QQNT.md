@@ -193,6 +193,11 @@ python probe\probe_qq_pane.py
 走 UIA 路线的话，直接用 `QQSafeChat` 的 `uia_debug.py` 或 `qq-operations` 的
 `scripts/qq_recon.ps1` / `qq_diag.ps1` 拾取控件，比我们自己写拾取器省事。
 
+## 参考资料
+
+- 详细架构设计（采集器抽象、图像判断、模型档案与驻留计划、Clef-Omni 就绪清单）：
+  [ARCHITECTURE.md](ARCHITECTURE.md)
+
 ## 注意事项
 
 - **QQ 必须打开、不能最小化**；UIA 路线还要求**前台**（后台只有约 9 个节点）。

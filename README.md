@@ -267,6 +267,9 @@ OCR 用 RapidOCR 的中英文模型；上游为韩文 KakaoTalk 加的 Windows.M
 [`TheD0ubleC/QQSafeChat`](https://github.com/TheD0ubleC/QQSafeChat)（都是 MIT、都不注入）。
 `probe/probe_qq_windows.py` 和 `probe/probe_qq_pane.py` 是像素路线的测量探针。
 
+架构设计（含 UIA 采集器接口、给判断模型附截图的通道、模型档案与驻留计划、
+以及 Clef-Omni 30B-A3B 多模态就绪清单）见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+
 ## 故障排查
 
 | 现象 | 原因 / 处理 |
