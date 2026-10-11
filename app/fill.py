@@ -18,6 +18,8 @@ k32.GlobalFree.argtypes = [ctypes.c_void_p]
 u32.SetClipboardData.restype = ctypes.c_void_p
 u32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
 
+from app.capture import unminimize  # noqa: E402  （放在 ctypes 声明之后，避免循环导入时的顺序问题）
+
 
 def set_clipboard(text):
     """写剪贴板。剪贴板可能被别的程序占着（剪贴板管理器、截图工具），重试几次。"""
@@ -47,15 +49,31 @@ def set_clipboard(text):
 
 
 def fill(hwnd, area, text):
-    """area = 消息区 (x0, y0, x1, y1)；输入框就在底线 y1 下面。"""
-    from app.capture import unminimize
-
-    set_clipboard(text)
-    r = w.RECT()
-    if ctypes.windll.dwmapi.DwmGetWindowAttribute(hwnd, 9, ctypes.byref(r), ctypes.sizeof(r)) != 0:  # 扩展边界，跟 WGC 帧对齐
-        u32.GetWindowRect(hwnd, ctypes.byref(r))
+    """area = 消息区 (x0, y0, x1, y1)，**窗口内坐标**；输入框就在底线 y1 下面。
+    微信用这个：chat_area 只给得出消息区，输入框靠分隔线 +40px 推。"""
+    r = _frame_rect(hwnd)
     x0, _, _, y1 = area
-    cx, cy = r.left + x0 + 60, r.top + y1 + 40  # 分隔线下 40px = 输入框文字区；工具栏和「发送」在输入区最底下，碰不到
+    _paste_at(hwnd, r.left + x0 + 60, r.top + y1 + 40, text)
+
+
+def fill_rect(hwnd, rect, text):
+    """rect = 输入框的**屏幕坐标**矩形 (x0, y0, x1, y1)，点它中间。
+    UIA / 像素定位能给准输入框位置时用这个，比按分隔线推算稳。"""
+    x0, y0, x1, y1 = rect
+    _paste_at(hwnd, (int(x0) + int(x1)) // 2, (int(y0) + int(y1)) // 2, text)
+
+
+def _frame_rect(hwnd):
+    """窗口的扩展边界（跟 WGC 帧对齐）。DwmGetWindowAttribute 失败就退回 GetWindowRect。"""
+    r = w.RECT()
+    if ctypes.windll.dwmapi.DwmGetWindowAttribute(hwnd, 9, ctypes.byref(r), ctypes.sizeof(r)) != 0:
+        u32.GetWindowRect(hwnd, ctypes.byref(r))
+    return r
+
+
+def _paste_at(hwnd, cx, cy, text):
+    """把文本写进剪贴板 → 点 (cx, cy) → Ctrl+End → Ctrl+V。绝不发回车、绝不点发送。"""
+    set_clipboard(text)
     unminimize(hwnd)
 
     # SetForegroundWindow 有前台窗口保护，普通后台进程会被拒；AttachThreadInput 绕过
@@ -66,7 +84,7 @@ def fill(hwnd, area, text):
         u32.AttachThreadInput(our_tid, fg_tid, True)
         u32.SetForegroundWindow(hwnd)
         u32.AttachThreadInput(our_tid, fg_tid, False)
-        time.sleep(0.15)  # 给微信一点时间响应前台切换
+        time.sleep(0.15)  # 给聊天软件一点时间响应前台切换
 
     old = w.POINT()
     u32.GetCursorPos(ctypes.byref(old))

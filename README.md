@@ -259,16 +259,16 @@ OCR 用 RapidOCR 的中英文模型；上游为韩文 KakaoTalk 加的 Windows.M
 适配一起移除了（历史版本见 git 记录）。
 
 **QQ NT（Windows）目前还不支持。** 调研、参考项目、实测数据和可行路线都记在
-[docs/QQNT.md](docs/QQNT.md)。结论是：现有 `chat_area()` 的像素锚点在 QQ NT 上失效
-（聊天区是壁纸/渐变，不是平底色），但 **QQ NT 的控件在 UIA 无障碍树上是完整暴露的**
-（输入框 `qq-msg-editor`、头部联系人 `chat-header__contact-name`、己方气泡标记
-`container--self`），走 UIA 能绕开像素定位、也不用 OCR。可直接参考
-[`treers2/qq-operations`](https://github.com/treers2/qq-operations) 和
-[`TheD0ubleC/QQSafeChat`](https://github.com/TheD0ubleC/QQSafeChat)（都是 MIT、都不注入）。
-`probe/probe_qq_windows.py` 和 `probe/probe_qq_pane.py` 是像素路线的测量探针。
+[docs/QQNT.md](docs/QQNT.md)。早期看好走 UIA 无障碍树（社区公开了 `qq-msg-editor`、
+`container--self` 等控件类名），但**实测在 QQ 9.9.31 / 9.9.36 上这些类名根本不存在**：
+加上 `--force-renderer-accessibility` 后树能从 9 个节点涨到 389 个，但类名全空、文本节点没有几何信息、
+消息输入框没暴露、聊天区是 D3D 合成——拿不到「谁说的、说了什么、输入框在哪」。
+所以 QQ 改走**像素路线**（WGC 抓帧 + QQ 专用面板/输入框定位 + OCR + 高蓝低红判己方），
+实测配色与探针都在文档里。
 
-架构设计（含 UIA 采集器接口、给判断模型附截图的通道、模型档案与驻留计划、
-以及 Clef-Omni 30B-A3B 多模态就绪清单）见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+采集器接口（P0）已经落地：`app/collectors/`（`base.py` + `ocr_wechat.py`）+ `ChatApp.collector`
+引擎字段，QQ 的像素采集器接上即可，`worker.py` / `main.py` 不用改。
+架构设计见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
 ## 故障排查
 

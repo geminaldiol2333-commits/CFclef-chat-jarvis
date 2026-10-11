@@ -18,7 +18,7 @@ from collections import deque
 
 from app import settings, update, worker
 from app.capture import find_chat_hwnd
-from app.fill import fill
+from app.fill import fill, fill_rect
 from app.overlay import Overlay
 from app.version import VERSION
 from core import providers
@@ -30,7 +30,8 @@ from app.i18n import T
 # 只是缓冲区，实际喂模型几条由设置里的「参考上下文」决定
 # senders：这个群里发过言的人，去重、最近的排最前；target：用户挑的回复对象（None = 跟着最近那个走）
 chats = {}
-state = {"area": None, "busy": False, "rerun": None, "hwnd": None, "chat": ""}
+state = {"area": None, "busy": False, "rerun": None, "hwnd": None, "chat": "",
+         "input": None}  # input = 输入框的屏幕坐标矩形（UIA/像素定位给的）；None = 按消息区推算（微信）
 results = queue.Queue()
 update_result = queue.Queue()  # 独立小队列，别跟 results 的 (kind, r, title, revision) 形状搅在一起
 
@@ -51,13 +52,16 @@ def target_of(title):
 def fill_reply(text):
     if state["hwnd"] is None:  # 子进程重开过，hwnd 可能换了，用最新的
         raise RuntimeError(T("未找到聊天窗口，请确认已经打开"))
-    if state["area"] is None:
+    if state["area"] is None and state["input"] is None:
         raise RuntimeError(T("输入区域尚不可用，请确认聊天窗口可见（不要最小化）"))
     if settings.reply_target() and ov.at_prefix_enabled():
         target = target_of(ov.current_chat())  # 填进去的是界面上正看着的那个会话的对象
         if target:
             text = f"@{target} " + text  # 纯文本，微信不认成真正的 @，只是让群里看得出在跟谁说
-    fill(state["hwnd"], state["area"], text)
+    if state["input"] is not None:
+        fill_rect(state["hwnd"], state["input"], text)   # 采集器给了输入框的准确位置
+    else:
+        fill(state["hwnd"], state["area"], text)         # 微信：按消息区底线推算
 
 
 def spawn_worker():
@@ -212,6 +216,9 @@ def drain():
         if kind == "area":  # 只是窗口挪了位置，坐标跟着更新，别的什么都不用动
             state["area"] = msg[1]
             continue
+        if kind == "input":  # 采集器给出了输入框位置（屏幕坐标）；None = 按消息区推算
+            state["input"] = msg[1]
+            continue
         if kind == "chat":  # 微信切了会话，界面跟过去（用户正浏览别的会话时也跟，微信是准的）
             state["chat"] = msg[1]
             ov.set_chat(msg[1])
@@ -232,6 +239,7 @@ def drain():
             continue
         if kind == "dead":  # 采集彻底停了（微信关了之类），这才是真的要清状态
             state["area"] = None
+            state["input"] = None
             for c in chats.values():  # 在跑的分析作废，回来的结果不再往界面上贴
                 c["rev"] += 1
             state["rerun"] = None

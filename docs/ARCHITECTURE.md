@@ -1,6 +1,8 @@
 # 架构：采集器抽象 + 多模态判断 + Clef-Omni 就绪
 
-> 状态：**设计稿（未写代码）**。本文定架构、接口和改造清单；按最后一节的阶段实施。
+> 状态：**P0 采集器分层已落地**（`app/collectors/` + `worker.py` 壳 + `ChatApp.collector` + `fill_rect`/`input` 事件）。
+> 其余部分（config v2、`LoadPlan`、`files` 图像通道、QQ 采集器）仍是设计。
+> 经实测修正：**QQ 走像素路线**，UIA 在本机 QQ 版本上读不到聊天（见 [QQNT.md](QQNT.md)）。
 > 目标有两件事：**(1)** 用 UIA 支持 QQ NT；**(2)** 让 Clef-Omni（30B-A3B，多模态决策模型）
 > 落地时只改配置、不改代码。
 
@@ -55,8 +57,8 @@ app.fill.fill(hwnd, area, text)           ← 按 chat_area 的分隔线 +40px �
 
 ```
 ┌─ 采集层 Collector ────────────────────────────────────────────────┐
-│  OcrCollector(微信)      UiaCollector(QQ NT)     VisionCollector(?)│
-│  抓帧 → chat_area → OCR   前台唤起 → UIA 类名取节点   只截帧，不 OCR  │
+│  OcrCollector(微信)    PixelQqntCollector(QQ NT)  UiaCollector(备用)│
+│  抓帧 → chat_area → OCR   WGC 抓帧 + QQ 专用定位 + OCR   读无障碍树（见注）│
 │  产出：Turn(who, name, text, media=[])                            │
 │  能力：provides_text / provides_media / can_insert / session_key   │
 └───────────────┬───────────────────────────────────────────────────┘
@@ -143,13 +145,13 @@ class Collector(Protocol):
 
 ### 3.2 两种实现
 
-| | `OcrCollector`（微信，现有逻辑搬家） | `UiaCollector`（QQ NT，新） |
+| | `OcrCollector`（微信，**已实现**） | `PixelQqntCollector`（QQ NT，待实现） |
 | --- | --- | --- |
-| 找窗口 | `capture.find_chat_hwnd`（进程名 + 标题） | 进程名 `qq.exe` + 标题 `QQ` **且含搜索框**的那个窗口 |
-| 会话名 | 头部 OCR（`ocr.read_title`） | `chat-header__contact-name` 的文本 |
-| 消息 | WGC 抓帧 → `chat_area` → `Reader.read` → 按底色分 me/her | UIA 节点：气泡类名正则 + **`container--self` 判己方** |
-| 输入框 | `chat_area` 的分隔线推 +40px | `qq-msg-editor` 的实时 `BoundingRectangle` |
-| 能力 | text ✅ / media ✅（原始帧）/ insert ✅ / needs_foreground ❌ | text ✅ / media ✅（原始帧）/ insert ✅ / **needs_foreground ✅** |
+| 找窗口 | `capture.find_chat_hwnd`（进程名 + 标题） | 进程名 `qq.exe` + 标题恰好 `QQ`（实测只有一个可见顶层窗） |
+| 会话名 | 头部 OCR（`ocr.read_title`） | 面板顶部那条交 `read_title` |
+| 消息 | WGC 抓帧 → `chat_area` → `Reader.read` → 按底色分 me/her | WGC 抓帧 → QQ 专用面板定位 → `Reader.read` → 高蓝低红判己方 |
+| 输入框 | `chat_area` 的分隔线推 +40px | 聊天区底部浅色圆角矩形，用 `emit("input", rect)` 发出去 |
+| 能力 | text ✅ / media ✅（原始帧）/ insert ✅ / needs_foreground ❌ | 同左，`needs_foreground` 也是 ❌（不抢焦点） |
 
 QQ NT 侧的实测选择器（来自 `treers2/qq-operations`，见 `docs/QQNT.md`）：
 
@@ -346,18 +348,25 @@ class LoadPlan:
 `local_llama_server`、`local_models_dir` 保持顶层。
 迁移要**幂等**，并且迁移后第一次启动的行为和现在完全一样。
 
-## 8. 最大的取舍：QQ 的 UIA 需要抢焦点
+## 8. 前景取舍：实测后已作废（UIA 在本机 QQ 上读不到聊天）
 
+原本这里要定一个取舍：QQ 的 UIA 树只对前台窗口构建，所以「抢焦点 vs 停更」得选一个。
+**这个取舍现在不成立了**——实测（QQ 9.9.31 / 9.9.36，证据见 [QQNT.md](QQNT.md#uia-实测否定2026-10qq-nt-9931--9936)）：
+加上 `--force-renderer-accessibility` 后树确实能建起来（9 → 389 个节点），但
+**类名全空、文本节点没有几何信息、消息输入框根本没暴露、聊天区是 D3D 合成**，
+拿不到「谁说的、说了什么、输入框在哪」。所以 UIA 方案这两条路都走不了。
+
+保留这段的理由：如果哪天 QQ 又把聊天暴露回无障碍树，取舍会重新出现。届时：
+
+- **A. 按需抢焦点**：置前 + 等 800ms 读树 → 读完把焦点还回去（屏幕会闪、会打断打字）
+- **B. 只在 QQ 已在前台时读**：完全不打扰，但切走就停更
+
+现在实际走的是**像素路线（下表 C）**：不抢焦点、不依赖无障碍树，代价是要写 QQ 专用定位器。
 | 选项 | 做法 | 代价 |
 | --- | --- | --- |
-| **A. 按需抢焦点（推荐先做）** | 检测到对方新消息时，把 QQ 置前 + 等 800ms 读树 → 立刻把焦点还给原来的窗口（`SetForegroundWindow(原)`） | 屏幕会闪一下、你正好在打字时会打断。**必须**在设置里显式开启并提示，且提供「只在空闲时读」 |
-| **B. 只在 QQ 已在前台时读** | 完全不抢焦点；QQ 在后台就不再更新候选 | 你切走就停更——和「聊天窗口开着、别最小化」的现有要求类似，但更严格 |
-| **C. 走像素路线** | 不抢焦点 | `chat_area()` 在 QQ NT 上失效（壁纸/渐变），要先写 QQ 专用定位器，且主题/DPI 一变就崩 |
-| **D. 只读不抢 + 定期截图 OCR** | 折中 | OCR 会把会话列表读进去（定位失效），除非先解决 C |
-
-**推荐**：`A` 为默认（在设置页写明「QQ 模式可能需要短暂切换前台」），同时提供 `B` 作为
-「不打扰」选项；`C` 留作研究（`docs/QQNT.md` 里已有实测数据和探针）。
-这条取舍写进 README 和设置页提示，不藏着。
+| **A. 按需抢焦点（仅 UIA 可用时）** | 置前 + 等 800ms 读树，读完还焦点 | 屏幕闪、打断打字 |
+| **B. 只在 QQ 已在前台时读（仅 UIA 可用时）** | 完全不抢焦点 | 切走就停更 |
+| **C. 像素路线（当前采用）** | WGC 抓帧 + QQ 专用面板/输入框定位 + OCR + 高蓝低红判己方 | 要写定位器、换主题要调色；但不抢焦点、不依赖 UIA |
 
 ## 9. Clef-Omni 就绪清单（将来要改的东西 = 只有配置）
 
@@ -385,7 +394,8 @@ class LoadPlan:
 | `app/collectors/__init__.py` | 采集器注册表（按 `chatapps` 的 key 选实现） |
 | `app/collectors/base.py` | `Turn` / `Media` / `Capabilities` / `Collector` / `InputTarget` |
 | `app/collectors/ocr_wechat.py` | 把 `worker.py` 里现有的找窗口→抓帧→`chat_area`→`Reader` 逻辑搬进来 |
-| `app/collectors/uia_qqnt.py` | UIA 采集器：前台唤起、双模式、类名取节点、`container--self`、`qq-msg-editor` 填入 |
+| `app/collectors/uia_qqnt.py` | （备用）UIA 采集器：前台唤起、双模式、类名取节点；本机 QQ 版本实测拿不到内容，先不实现 |
+| `app/collectors/pixel_qqnt.py` | QQ NT 像素采集器：窗口定位、面板左边界、会话名、高蓝低红判己方、`emit("input")` 给输入框 |
 | `app/perception.py` | 图像编码 + `text/vision/auto` 决策 + 组装 `{state, files}` |
 | `app/model_profiles.py` | `ModelProfile` / `LoadPlan` / 显存探测 / 分片 GGUF 解析 / 能力探测封装 |
 | `docs/ARCHITECTURE.md` | 本文 |
@@ -411,9 +421,9 @@ class LoadPlan:
 
 | 阶段 | 做什么 | 验收（可测） |
 | --- | --- | --- |
-| **P0 缝与地基** | 采集器接口 + `OcrCollector` 包装现有微信逻辑（**行为零变化**）；config v2 + 迁移；能力探测 + doctor | 微信端到端和现在一模一样；`doctor` 能报出 clef-flash 的 `decisions` / `image` 能力；旧 config 自动迁移 |
-| **P1 图像判断** | `app/perception.py` + `files` 通道；下载 `mmproj-Clef-Flash-Q8_0.gguf`（624 MB）；`--mmproj` 启动参数 | `tools/verify_local.py` 能在「文本」和「文本+截图」两种模式下都跑通，并对比判断结果 |
-| **P2 QQ NT（UIA）** | `UiaCollector`：窗口定位、双模式、会话名、`container--self`、`qq-msg-editor` 填入、前台唤起策略 | 用 `probe/probe_qq_windows.py` + `QQSafeChat` 的 `uia_debug.py` 校准；QQ 里来消息能出候选、能填入；微信不受影响 |
+| **P0 缝与地基** ✅ **已完成** | 采集器接口 + `OcrCollector`（微信逻辑原样搬家，行为零变化）；`ChatApp.collector` 引擎字段；`fill_rect` + `input` 事件（采集器可直接给输入框矩形） | 已验：`python -m app.worker` 用假采集器断言事件流转（resumed → area/input/chat/lines → dead）与启动失败不重试；微信路径代码未变 |
+| **P1 图像判断** | `app/perception.py` + `files` 通道；下 `mmproj-Clef-Flash-Q8_0.gguf`（624 MB）；`--mmproj` 启动参数 | `tools/verify_local.py` 在「文本」和「文本+截图」两种模式下都跑通并对比 |
+| **P2 QQ NT（像素）** | `PixelQqntCollector`：面板左边界、会话名 OCR、高蓝低红判己方、输入框矩形、颜色可配 | 用 `probe/probe_qq_pane.py` 校准；QQ 来消息能出候选、能填入；微信不受影响 |
 | **P3 Clef-Omni** | 档案换成 clef-omni + `mmproj`；`LoadPlan` 换小起草模型；升 llama.cpp | GGUF 发布后：`/v1/systemone` 判断正常、带图正常、显存不超；起草用 4B 模型也出得来三条 |
 
 ## 12. 风险与开放问题

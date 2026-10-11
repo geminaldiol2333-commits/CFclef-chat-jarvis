@@ -1,16 +1,15 @@
 # -*- coding: utf-8 -*-
-"""子进程：截图 → 定位消息区 → OCR 头部会话名和消息 → 按会话去重，全在这边跑。
-一次 OCR 250~800ms，放父进程的 Qt 主线程界面就僵了。
-只往队列里丢纯 tuple/str（底色 bg 是 numpy，留在这边不过队列）。帧全程内存，绝不落盘。"""
+"""采集子进程的壳：跑哪一拍（暂停/恢复）、把采集器吐出来的消息转发给父进程。
+
+真实采集逻辑在 app/collectors/ 里（微信=截图+OCR，QQ NT=像素定位等）。
+一次 OCR 250~800ms、UIA 读树也可能几百毫秒，放父进程的 Qt 主线程界面就僵了，所以都在这里跑。
+只往队列里丢纯 tuple/str/bytes；帧和 COM 对象都留在子进程内部，绝不落盘。
+"""
 import ctypes
 import time
 import traceback
 
-import numpy as np
-
-from app import chatapps
-from app.capture import Capture, chat_area, unminimize
-from app.ocr import Reader, read_title, similar
+from app import chatapps, collectors
 
 
 def _err(q):
@@ -18,89 +17,115 @@ def _err(q):
     q.put(("status", " ".join(traceback.format_exc().split())[-200:]))
 
 
-def _packet(full, area, title, reader, lines):
-    """调试视图的一帧：整帧缩到长边 ≤1100 再走队列（原帧 2560 宽裸传要 20MB），只在内存里传，不落盘。
-    整数步长切片够用，不引新依赖；框和坐标照发原始值，画的那边按 scale 折算。"""
-    k = max(1, -(-max(full.shape[:2]) // 1100))
-    small = np.ascontiguousarray(full[::k, ::k])
-    return {"w": small.shape[1], "h": small.shape[0], "rgb": small.tobytes(), "scale": k,
-            "area": tuple(int(v) for v in area[:4]) if area else None,
-            "pane_top": int(area[5]) if area else 0, "title": title,
-            "boxes": reader.last_boxes if reader else [],
-            "lines": [(w, n, t) for w, n, t, _ in lines],
-            "ocr_ms": reader.last_ms if reader else 0, "ts": time.time()}
+def _one_line(exc: BaseException) -> str:
+    return " ".join(str(exc).split())[:120] or type(exc).__name__
 
 
 def run(q, hwnd, enabled, debug_on, app_key=None):
-    """enabled 置位=采集，清掉=暂停。暂停时停掉 WGC 会话（Windows 那圈黄色采集边框也跟着没了），
-    恢复时重开一个；readers 一直留着，去重状态不丢，恢复后不会把屏幕上的旧消息再报一遍。
+    """enabled 置位=采集，清掉=暂停。暂停时让采集器收掉采集（微信的 WGC 会话一起停掉，
+    Windows 那圈黄色采集边框也跟着没了），恢复时重新开一个；去重状态留在采集器里，
+    恢复后不会把屏幕上的旧消息再报一遍。
     debug_on 置位才往队列里送整帧（一帧 2~3MB），关着一点额外活都不干。"""
     ctypes.windll.user32.SetProcessDPIAware()
     app = chatapps.get(app_key)
-    cap = None
-    readers = {}  # {会话名: Reader}，一个会话一套去重状态
-    title, head = "", None  # 当前会话名 / 上一帧的头部像素
-    last_area = None  # 上次发给父进程的 4 元组，变了才再发一次
-    warned = False  # 消息区识别失败是否已经报过，拖窗口时别每帧刷一条
+    emit = lambda kind, *payload: q.put((kind,) + tuple(payload))
+
+    try:
+        collector = collectors.build(app, hwnd, emit, debug_on)
+    except Exception as exc:
+        q.put(("dead", "无法开始采集：" + _one_line(exc)))
+        return
+
+    started = False
     while True:
         if not enabled.is_set():
-            if cap is not None:
-                cap.stop()
-                cap = None
-                q.put(("paused",))
+            if started:
+                collector.stop()
+                started = False
             enabled.wait()
             continue
-        if cap is None:
+        if not started:
             try:
-                cap = Capture(hwnd)
-            except Exception as e:
-                q.put(("dead", "无法开始采集：" + (" ".join(str(e).split())[:120] or type(e).__name__)))
+                collector.start()
+            except Exception as exc:
+                q.put(("dead", "无法开始采集：" + _one_line(exc)))
                 enabled.clear()  # 自己清掉，下一圈就去等着，别一秒重试几十次
                 continue
-            q.put(("resumed",))
-        if not cap.alive():
+            started = True
+        if not collector.alive():
             break
         try:
-            unminimize(hwnd)
-            full = cap.settled()
-            if full is not None:
-                reader, lines = None, []  # 调试视图要用，消息区没认出来时就是空的
-                area = chat_area(full)  # 每次停稳都重算：拖完窗口微信布局会晚一拍才铺好，只按尺寸变化算一次会锁死
-                if area is None:
-                    if not warned:
-                        q.put(("status", "消息区认不出来（窗口太小？）"))
-                        warned = True
-                else:
-                    warned = False
-                    cap.area = area  # 采集线程拿它做 diff
-                    x0, y0, x1, y1, bg, y_pane = area
-                    rect = (x0, y0, x1, y1)
-                    if rect != last_area:
-                        q.put(("area", rect))
-                        last_area = rect
-                    crop = full[y_pane:y0, x0:x1]  # 头部：会话名在这里
-                    if head is None or not np.array_equal(crop, head):  # 名字没动就别白跑一次 OCR
-                        head = crop
-                        name = read_title(crop, app)
-                        # OCR 抖一下（「小分队」↔「小分认」）不能分裂出一个新会话
-                        name = next((k for k in readers if similar(k, name)), name) if name else ""
-                        # ponytail: 认不出就沿用上次；开头就认不出给个占位名，总比把消息全丢了强
-                        name = name or title or "当前会话"
-                        if name != title:
-                            title = name
-                            q.put(("chat", title))
-                    reader = readers.setdefault(title, Reader(app))
-                    lines = reader.read(full[y0:y1, x0:x1], bg)
-                    new = reader.new_lines(lines)
-                    if new:
-                        q.put(("lines", title, new, rect))
-                if debug_on.is_set():
-                    q.put(("debug", _packet(full, area, title, reader, lines)))
+            collector.poll(emit)
         except Exception:
             _err(q)  # 一帧出错不退出
         time.sleep(0.05)
+
     q.put(("dead", "采集停了（聊天窗口关了？）"))
     try:
-        cap.wait()  # 采集线程若是报错死的，这里把错抛出来
+        collector.wait()  # 采集底层若是异步的（WGC），这里把线程错误抛出来
     except Exception:
         _err(q)
+
+
+if __name__ == "__main__":
+    # 自测（不碰真实窗口）：用一个假采集器验证事件流转和失败处理。
+    # 跑法：python -m app.worker
+    import queue
+    import threading
+    from unittest.mock import patch
+
+    class _Stub(collectors.BaseCollector):
+        key = "stub"
+
+        def __init__(self, hwnd, emit, debug_on=None):
+            super().__init__(hwnd, emit, debug_on)
+            self.n = 0
+
+        def start(self):
+            self.emit("resumed")
+
+        def stop(self):
+            self.emit("paused")
+
+        def poll(self, emit):
+            self.n += 1
+            emit("area", (1, 2, 3, 4))
+            emit("input", (10, 20, 30, 40))
+            emit("chat", "会话A")
+            emit("lines", "会话A", [("her", None, "你好")], (1, 2, 3, 4))
+
+        def alive(self):
+            return self.n < 3
+
+    q, enabled, debug = queue.Queue(), threading.Event(), threading.Event()
+    enabled.set()
+    with patch.object(collectors, "build", lambda app, hwnd, emit, debug_on=None: _Stub(hwnd, emit, debug_on)):
+        t = threading.Thread(target=run, args=(q, 0, enabled, debug, None), daemon=True)
+        t.start()
+        t.join(timeout=5)
+    assert not t.is_alive(), "worker 没在 alive() 变 False 后退出"
+    events = []
+    while not q.empty():
+        events.append(q.get())
+    kinds = [e[0] for e in events]
+    assert kinds[0] == "resumed" and kinds[-1] == "dead", kinds
+    assert kinds.count("lines") == 3, kinds
+    assert ("input", (10, 20, 30, 40)) in events, events
+    assert events[-1] == ("dead", "采集停了（聊天窗口关了？）"), events[-1]
+
+    class _Boom(_Stub):
+        def start(self):
+            raise RuntimeError("窗口没了")
+
+    q2, en2 = queue.Queue(), threading.Event()
+    en2.set()
+    with patch.object(collectors, "build", lambda app, hwnd, emit, debug_on=None: _Boom(hwnd, emit, debug_on)):
+        t2 = threading.Thread(target=run, args=(q2, 0, en2, debug, None), daemon=True)
+        t2.start()
+        time.sleep(0.5)
+    assert not en2.is_set(), "启动失败后没清掉 enabled，会重试风暴"
+    first = q2.get_nowait()
+    assert first[0] == "dead" and "无法开始采集" in first[1], first
+    en2.set()
+    t2.join(timeout=3)
+    print("worker ok")

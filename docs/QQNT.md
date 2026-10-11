@@ -14,12 +14,11 @@
 2. **本项目的「截图 + OCR + 比颜色」路线在 QQ NT 上不好走**：`chat_area()` 靠「面板底色 =
    画面里最常见的颜色」定位消息区和输入框，而 QQ NT 的聊天区是壁纸/渐变，锚点直接失效
    （实测返回整个窗口，见下文）。
-3. **好消息：QQ NT 有更好的路线——UIA 无障碍树，而且控件类名是固定的。**
-   社区已经把输入框、头部联系人、气泡、**己方气泡标记**都摸出来了，
-   `己方/对方` 直接读类名（`container--self`），不用比颜色、也不用 OCR。
-   两个完整参考实现见 [`treers2/qq-operations`](https://github.com/treers2/qq-operations)（PowerShell，MIT）
-   和 [`TheD0ubleC/QQSafeChat`](https://github.com/TheD0ubleC/QQSafeChat)（Python + `uiautomation`，MIT）。
-   **这条路能完全绕开第 2 条的阻塞点，推荐优先考虑。**
+3. **UIA 路线在本机的 QQ 版本上走不通（实测否定）。** 社区（`treers2/qq-operations`）公开了
+   QQ NT 的 UIA 控件类名（`qq-msg-editor` / `chat-header__contact-name` / `container--self`），
+   听起来是最优解；但我在 QQ **9.9.31 和 9.9.36** 两个已安装版本上都验证过：
+   那些类名**根本不存在**，聊天内容也不在无障碍树里（实测数据见下文「UIA 实测否定」）。
+   所以 QQ 的可行路线是**像素路线**（本项目的强项），UIA 留着看 QQ 以后会不会重新暴露。
 4. 气泡颜色随主题变（本机那套是改过的），所以如果要走像素路线，颜色规则得可配置或按主题标定；
    走 UIA 路线则不需要关心主题。
 
@@ -72,21 +71,42 @@
 `Frostyume/AutoSendMsg`（微信/QQ 定时发送）、`RyuuMeow/NeverThinkAutoReply`（PySide6 + EasyOCR 热键截图）、
 `DreDabe/auto-reply`（VLM 直接看窗口）。思路可参考，但都没有解决 QQ NT 的定位问题。
 
-## UIA 蓝图（来自 qq-operations 的实测选择器）
+## UIA 实测否定（2026-10，QQ NT 9.9.31 / 9.9.36）
 
-QQ NT 用 Chromium/Electron 渲染，但**控件完整暴露在 UIA 树上**，类名固定：
+`qq-operations` / `QQSafeChat` 那套「读 UIA 类名」的路线在这两个版本上**不可用**。实测证据：
+
+| 检查项 | 实测结果 |
+| --- | --- |
+| 不使用 `--force-renderer-accessibility` | 整棵树只有 **9 个节点**（QQ 只给前台窗口建树；且这 9 个里没有任何消息） |
+| 加上 `--force-renderer-accessibility` 启动 | 节点涨到 **389 个**（说明参数有效、树建起来了） |
+| `ClassName` | **389 个里 389 个是空字符串**（只有窗口级的 `Chrome_RenderWidgetHostHWND`） |
+| `AutomationId` | 387 个为空，只有 `app` / `loading` / `drag-area` 几个 |
+| `qq-msg-editor` / `chat-header__contact-name` / `container--self` / `message-container` | **全部找不到**（两个版本都找不到） |
+| 聊天区里的节点 | 只有 20 个有几何信息，其中 `TextControl` 仅 4 个 |
+| 有文本的 `TextControl` | 120 个，但 `BoundingRectangle` 全是 `(0,0,0,0)` → 无法排序、无法按左右对齐判己方/对方 |
+| `EditControl`（唯一一个） | rect `(567,280,771,305)`，在**左侧会话列表**里 → 那是搜索框，**消息输入框根本没暴露** |
+| `TextPattern` | 整个面板能取到 **1192 个字符**，但 `GetVisibleRanges()` 返回 `E_NOTIMPL`；按行迭代只能拿到前 2 行且带几何 |
+| 窗口子控件 | 存在 `Intermediate D3D Window` → 聊天区是**GPU 合成**的，不在无障碍树里 |
+| 两个版本的 `application.asar` 里搜类名 | `qq-msg-editor` 等字符串**一个都没有** |
+
+结论：**QQ 9.9.36 的聊天内容是自绘 / D3D 合成，UIA 拿不到「谁说的、说了什么、输入框在哪」**。
+`QQSafeChat` README 里那条「只能选中整个窗口（PaneControl）」的排错项，说的就是这个现象。
+`qq-operations` 记录的类名应该来自另一个 QQ 构建/时期，留作参考——如果哪天 QQ 重新暴露，
+按下面的选择器和坑位接进来即可（接口已经留好，见 [ARCHITECTURE.md](ARCHITECTURE.md) 的采集器）。
+
+### 供参考：文档记录的类名（本机版本实测不存在）
 
 | 用途 | 类名 / 条件 |
 | --- | --- |
 | 输入框 | `qq-msg-editor` |
 | 头部联系人名（收件人） | `chat-header__contact-name` |
 | 气泡容器 | 正则 `^(message-container\|msg-content-container)` |
-| **己方气泡** | 容器类名匹配 `container--self` —— **自己/对方直接读类名，不用比颜色** |
+| **己方气泡** | 容器类名匹配 `container--self` |
 | 发送按钮 | 名称 `发送`（发文件时确认浮层是 `发送(1)`） |
 | 主面板识别 | 标题为 `QQ` **且**里面真的有搜索框（Edit 控件）的那个窗口 |
-| 界面模式 | 找名称匹配 `切换为经典模式` 的控件 → 当前是**效率模式**；`切换为效率模式` → 当前是**经典模式** |
+| 界面模式 | 名称 `切换为经典模式` → 效率模式；`切换为效率模式` → 经典模式 |
 
-必须知道的三个坑（都来自该项目的实测记录）：
+必须知道的三个坑（如果哪天要用 UIA）：
 
 1. **QQ 只对「前台」窗口构建完整 UIA 树。** Electron/Chromium 的行为：窗口在后台时树只有约 9 个节点，
    连搜索框都找不到。它的做法是 `Revive-QQPanel`：`ShowWindow(hwnd, 9)`（恢复）+ `SetForegroundWindow`
@@ -162,21 +182,28 @@ def _qq_me(bg):
 | 脆弱点 | QQ 大版本更新后类名可能变 | 主题、壁纸、DPI、QQ 更新 |
 | 合规 | ✅ 不注入、不读内存 | ✅ 只截图 |
 
-## 落地建议
+## 落地建议（已根据实测修正）
 
-**首选 UIA 类名法。** 具体做法：
+**首选像素路线**——UIA 拿不到东西，而像素本来就是本项目的强项。采集器接口（P0）已经落地：
 
-1. `app/chatapps.py` 里给 QQ 条目加个标记（如 `collect = "uia"`），只用来声明「这个 app 走 UIA」，不参与像素那条路。
-2. 新写 `app/qq_uia.py`：用 `uiautomation`（或 `pywinauto`）按上表类名取节点，输出跟
-   `app/ocr.py::Reader.read()` **一样的结构** `[(who, name, text)]`（`who ∈ me/her`）。
-   这样 `main.py` 往上（会话跟踪、engine、悬浮窗、填入）一行都不用改。
-3. 填入选候选仍可复用 `app/fill.py`（剪贴板 + Ctrl+V），但输入框改用 `qq-msg-editor` 的实时矩形，
-   比按分隔线 +40px 猜稳得多。
-4. 会话名用 `chat-header__contact-name`；多会话合并窗口标题不可信（见上文第 3 个坑）。
-5. 依赖 `uiautomation` 只在 QQ 模式下 import，微信模式不受影响。
+- `app/collectors/`（`base.py` 接口 + `ocr_wechat.py` 微信实现）、`app/worker.py` 现在只当壳，
+  `ChatApp.collector` 字段决定用哪个引擎（`ocr` / `pixel` / `uia`）。
+- 填入已经支持「采集器直接给输入框矩形」（`app/fill.py::fill_rect` + `main.py` 的 `input` 事件），
+  不用再按消息区分隔线推。
+- 所以剩下的只是写 `app/collectors/pixel_qqnt.py`：
 
-**次选像素路线**：写 QQ 专用定位器（竖向分界线找面板左边界、底部浅色圆角矩形找输入框顶），
-配 `probe/probe_qq_pane.py` 对着实际主题调参，颜色规则做成 `config.json` 可配。
+1. **窗口**：进程 `qq.exe` + 标题恰好 `QQ`（实测：只有一个可见顶层窗，默认效率模式）。
+2. **面板左边界**：会话列表背景是**平色**、聊天区是壁纸 → 按列算「平色占比」找分界；
+   也可以用 UIA 容器矩形的实测值（会话列表 `520..833`、聊天区 `832..2105`，物理像素 @125%）做交叉验证。
+3. **输入框**：聊天区底部那块浅色圆角矩形（实测输入区在窗高 62% 以下），
+   找到后把屏幕坐标用 `emit("input", rect)` 发出去。
+4. **会话名**：聊天区顶部那条（面板顶 ~ 消息区顶）交 `app/ocr.py::read_title` 识别。
+5. **谁说的**：用高蓝低红的规则（见上文真值表），颜色写进 `config.json` 以便换主题。
+6. 对着 `probe/probe_qq_pane.py` 的输出调参；调好后 `python tools/verify_local.py` 跑全链路。
+
+**UIA 保留但暂不用**：类名、双模式识别、前台重建（`ShowWindow(9)` + `SetForegroundWindow` + 等 800ms）
+都记在上面了。哪天 QQ 重新把聊天暴露到无障碍树里，加一个 `app/collectors/uia_qqnt.py` 就能接上，
+`worker.py` / `main.py` 一行不用改——这正是 P0 分层的意义。
 
 ## 怎么验证 / 怎么调
 

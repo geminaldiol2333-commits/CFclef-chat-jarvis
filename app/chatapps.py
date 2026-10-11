@@ -31,6 +31,7 @@ class ChatApp:
     join: str                    # how OCR fragments inside one bubble are glued
     is_me: Callable[[np.ndarray], bool]
     trim_top: Callable[[np.ndarray], int] = lambda chat: 0  # rows to skip (pinned notice, ...)
+    collector: str = "ocr"       # 采集引擎：app/collectors/ 里注册的名字（ocr / pixel / uia）
 
 
 WECHAT = ChatApp("wechat", "微信", ("weixin.exe", "wechat.exe"), "微信", (),
