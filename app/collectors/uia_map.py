@@ -186,22 +186,47 @@ def _rows_by_y(nodes: Sequence[Node], gap: int) -> list[list[Node]]:
     return rows
 
 
+COUNT_ONLY = re.compile(r"^[（(]\d+[)）]$")   # 群成员数，不是会话名（实测过：(423) 这种）
+
+
+def _ancestor_of_kind(nodes: Sequence[Node], node: Node, kinds: tuple[str, ...]) -> Node | None:
+    """往上找最近的某一类祖先。"""
+    by_index = {n.index: n for n in nodes}
+    i = node.parent
+    while i >= 0:
+        a = by_index.get(i)
+        if a is None:
+            return None
+        if a.type in kinds:
+            return a
+        i = a.parent
+    return None
+
+
 def find_session_row(nodes: Sequence[Node], pane_left: int, sel: Selectors = SEL_DEFAULT,
                      list_node: Node | None = None, panel_right: int = 0) -> list[Node]:
-    """头部那一行的所有文本节点（按 x 排好）。
+    """会话名所在的那一行。三个来源，从可靠到不可靠：
 
-    为什么要「一行」而不是「一条」：QQ 的头部会被切成好几个文本节点
-    （实测同一行上有 len=12 / 1 / 21 / 5 四段），只取最左边那条会只拿到一个碎片，
-    而且随头部状态（成员数、按钮）飘。会话名最终取这一行拼起来的结果。
+      1. 类名命中（`chat-header__contact-name`，别的 QQ 构建/以后）；
+      2. **消息列表外面那层 `WindowControl` 的 Name** —— 本机实测它就是会话标题
+         （实测：群名 4 字→那层 Name 也是 4 字），不要几何、不受头部重绘影响；
+      3. 头部行文本（几何兜底）——实测头部会时隐时现，而且**成员数 `(423)` 会混进来**，
+         所以这里把“纯成员数”和单字符的 UI 碎片滤掉。
     """
     hit = find_first(nodes, sel.header)
     if hit is not None and hit.has_text:
         return [hit]
     if list_node is None or not list_node.has_geo:
         return []
+    wrap = _ancestor_of_kind(nodes, list_node, ("WindowControl",))
+    if wrap is not None and wrap.has_text and not COUNT_ONLY.match(wrap.text.strip()):
+        return [wrap]
     above = [n for n in nodes if n.type == "TextControl" and n.has_text
              and n.has_geo and n.rect[1] < list_node.rect[1]
              and n.rect[0] >= pane_left - PANE_TOL and n.rect[2] <= (panel_right or 10 ** 9)]
+    # 成员数、单字符 UI 碎片不是名字（除非实在没别的）
+    useful = [n for n in above if not COUNT_ONLY.match(n.text.strip()) and len(n.text.strip()) > 1]
+    above = useful or above
     if not above:
         return []
     # 取「最靠近消息列表顶部的那一行」——与缩放/最大化无关，
@@ -281,6 +306,87 @@ def _text_rows(nodes: Sequence[Node], box: tuple[int, int, int, int], gap: int =
     return _rows_by_y(inside, gap or 8)
 
 
+def message_containers(nodes: Sequence[Node], list_node: Node | None) -> list[Node]:
+    """消息列表里的「消息容器」，按 DOM 顺序（= 时间顺序）。
+
+    本机实测（群聊）：每个消息容器的 id 是 15+ 位数字，其子树结构非常规整：
+
+        d13 时间戳（可选） · d14 昵称 · d15 徽标（群等级） · d15 徽标（群头衔） · d16 正文
+
+    名字行与正文行是分开的两行（实测 y 差 35px）。这里只负责把容器挑出来。
+    """
+    if list_node is None:
+        return []
+    out = [n for n in descendants(nodes, list_node) if re.fullmatch(r"\d{15,}", n.aid or "")]
+    out.sort(key=lambda n: n.index)
+    return out
+
+
+def _glyph_gap(texts: Sequence[Node]) -> int:
+    hs = sorted(n.height for n in texts if n.height > 0)
+    return max(4, int(0.6 * hs[len(hs) // 2])) if hs else 8
+
+
+def turns_from_containers(nodes: Sequence[Node], list_node: Node,
+                          sel: Selectors = SEL_DEFAULT) -> list[Turn]:
+    """按消息容器读消息——有群等级/群头衔这类高特征文本时最可靠的一条路。
+
+    每个容器里的文本按 y 聚行：
+      · 第一行是「名字行」：同一行上深度最小的那串是昵称，剩下的短串是徽标（等级/头衔）；
+      · 其余行是正文。
+    判己方/对方：
+      · 有名字行 → 对方发的（QQ 不会在自己的消息上方重复自己的昵称）；
+      · 没名字行 → 靠右 = 我发的；居中（±8% 宽）= 系统提示，丢掉；
+      · 没名字行也没几何 → 丢掉（虚拟列表里没布局的那种，读了也不准）。
+
+    ponytail: 实测只有“全部子文本都有几何”的容器可读（已渲染的）；其余全部几何为 0，
+    那是虚拟列表滑动出去的项，直接跳过，不猜。
+    """
+    if list_node is None or not list_node.has_geo:
+        return []
+    width = max(1, list_node.rect[2] - list_node.rect[0])
+    mid = list_node.rect[0] + width / 2
+    turns: list[Turn] = []
+    for c in message_containers(nodes, list_node):
+        texts = [t for t in descendants(nodes, c)
+                 if t.type == "TextControl" and t.has_text and t.has_geo]
+        if not texts:
+            continue                     # 没布局的容器整条跳过，不猜
+        rows = _rows_by_y(texts, _glyph_gap(texts))
+        # 只有一行、而且这一行不止一段（昵称+徽标）→ 这是「有名字没正文」的消息，丢掉
+        if len(rows) == 1 and len(rows[0]) >= 2:
+            continue
+        name, body_rows = None, rows
+        for k, row in enumerate(rows):
+            if k == len(rows) - 1:
+                break                    # 最后一行留给正文
+            shallow = min(n.depth for n in row)
+            head = "".join(n.text.strip() for n in sorted(
+                (n for n in row if n.depth == shallow), key=lambda n: n.rect[0])).strip()
+            if not head or re.fullmatch(r"\d{1,2}[:：]\d{2}.*", head):
+                continue                 # 时间戳那一行不是名字行
+            # 名字行的特征：同行还有更深的短段（徽标），或者下面那行比它深（正文在更深一层）
+            deeper_in_row = any(n.depth > shallow for n in row)
+            deeper_below = all(n.depth > shallow for n in rows[k + 1])
+            if deeper_in_row or deeper_below:
+                name, body_rows = head, rows[k + 1:]
+                break
+        body = "".join(n.text.strip() for r in body_rows
+                       for n in sorted(r, key=lambda n: n.rect[0])).strip()
+        if not body:
+            continue
+        if name:
+            who = "her"
+        else:
+            flat = [n for r in body_rows for n in r]
+            cx = (min(n.rect[0] for n in flat) + max(n.rect[2] for n in flat)) / 2
+            if abs(cx - mid) <= 0.08 * width:
+                continue                 # 居中 = 系统提示（入群/撤回/公告）
+            who = "me" if cx > mid else "her"
+        turns.append(Turn(who=who, text=body, name=name))
+    return turns
+
+
 def build_turns_from_rows(nodes: Sequence[Node], list_node: Node,
                           sel: Selectors = SEL_DEFAULT) -> list[Turn]:
     """几何兜底：没有气泡类名时，用消息列表里的「文本行」当消息，靠左右对齐判己方/对方。
@@ -338,10 +444,12 @@ def _sender_name(nodes: Sequence[Node], bubble: Node, sel: Selectors) -> str | N
 
 def build_turns(nodes: Sequence[Node], sel: Selectors = Selectors(), *,
                 pane_left: int = 0, list_node: Node | None = None) -> list[Turn]:
-    """气泡节点 → Turn 列表（按 DOM 顺序 = 时间顺序）。
+    """气泡节点 → Turn 列表（按 DOM 顺序 = 时间顺序）。三条路径，从准到糙：
 
-    类名路径（气泡/己方标记都存在）优先；本机 QQ 9.9.x 上没有这些类名，
-    所以退回 `build_turns_from_rows` 的几何路径。两条都不行就返回空（调用方会提示）。"""
+      1. 类名路径（气泡/己方标记存在）——最准，其他 QQ 构建/以后可能又能用；
+      2. 消息容器路径（本机群聊实测可用：名字/徽标/正文分层清楚）；
+      3. 按 y 聚行的几何路径（最后手，容易把界面元素当消息）。
+    """
     bubbles = [n for n in nodes if any(x in n.key for x in sel.bubble)]
     if bubbles:
         bubbles.sort(key=lambda n: n.index)
@@ -358,6 +466,9 @@ def build_turns(nodes: Sequence[Node], sel: Selectors = Selectors(), *,
             turns.append(Turn(who=who, text=text, name=name))
         return turns
     if list_node is not None:
+        turns = turns_from_containers(nodes, list_node, sel)
+        if turns:
+            return turns
         return build_turns_from_rows(nodes, list_node, sel)
     return []
 
@@ -534,6 +645,72 @@ if __name__ == "__main__":
         turns = build_turns(nodes, pane_left=pl, list_node=lst)
         assert [t.who for t in turns] == ["her"] * kw.get("n_her", 5) + ["me"] * kw.get("n_me", 3), \
             f"{label}: {[t.who for t in turns]}"
+
+    # ── 群聊：消息容器分层（照真实 dump：d13 时间戳 / d14 昵称 / d15 徽标x2 / d16 正文）────
+    LIST = (742, 281, 2000, 976)
+    gn = [n(0, -1, 0, "PaneControl", PANEL),
+          n(1, 0, 1, "GroupControl", (520, 260, 833, 1165)),
+          n(2, 0, 1, "GroupControl", (742, 217, 2225, 1232)),
+          n(3, 2, 2, "GroupControl", LIST, aid="ml-root")]
+
+    def add_container(cid, specs, geo=True):
+        ci = len(gn)
+        gn.append(n(ci, 3, 3, "GroupControl", (800, 255, 1980, 1290) if geo else (0, 0, 0, 0), aid=cid))
+        for d, x0, y, x1, t in specs:
+            rect = (x0, y, x1, y + 22) if geo else (0, 0, 0, 0)
+            gn.append(n(len(gn), ci, d, "TextControl", rect, text=t))
+
+    # 对方：时间戳 + 昵称(d14) + 两个徽标(d15) + 正文(d16，下一行)
+    add_container("7000000000000000001", [(13, 817, 240, 880, "12:34"),
+                                         (14, 817, 264, 889, "昵称六个字"),
+                                         (15, 898, 264, 913, "LV"),
+                                         (15, 913, 264, 935, "99"),
+                                         (16, 830, 299, 988, "四个字符")])
+    # 只有名字行（没正文）→ 丢掉
+    add_container("7000000000000000002", [(14, 817, 364, 848, "两字"),
+                                         (15, 857, 364, 872, "LV"),
+                                         (15, 871, 364, 887, "9")])
+    # 自己发的：没名字行、靠右 → me
+    add_container("7000000000000000003", [(16, 1500, 400, 1800, "我自己发的")])
+    # 系统提示：没名字行、居中 → 丢掉
+    add_container("7000000000000000004", [(16, 1200, 450, 1550, "系统提示一条")])
+    # 虚拟列表里没布局的（全无几何）→ 整条跳过，不猜
+    add_container("7000000000000000005", [(14, 817, 500, 848, "两字"),
+                                         (15, 857, 500, 872, "LV"),
+                                         (16, 830, 535, 988, "看不见")], geo=False)
+
+    pane_left, _ = pane_bounds(gn, PANEL)
+    lst = find_message_list(gn, pane_left)
+    assert lst is not None and lst.aid == "ml-root"
+    turns = build_turns(gn, pane_left=pane_left, list_node=lst)
+    assert [(t.who, t.name, t.text) for t in turns] == [
+        ("her", "昵称六个字", "四个字符"),
+        ("me", None, "我自己发的"),
+    ], turns
+
+    # ── 会话名：优先用消息列表外层 WindowControl 的 Name（实测它就是会话标题）────
+    name_gn = [n(0, -1, 0, "PaneControl", PANEL),
+               n(1, 0, 1, "GroupControl", (520, 260, 833, 1165)),
+               n(2, 0, 1, "GroupControl", (742, 217, 2225, 1232)),
+               n(3, 2, 2, "WindowControl", (742, 281, 2000, 976), text="高速网盘"),
+               n(4, 3, 3, "GroupControl", LIST, aid="ml-root"),
+               n(5, 2, 2, "TextControl", (1031, 237, 1084, 263), text="(423)")]   # 成员数
+    pnl, _ = pane_bounds(name_gn, PANEL)
+    l2 = find_message_list(name_gn, pnl)
+    assert find_session(name_gn, pnl, list_node=l2, panel_right=PANEL[2]) == "高速网盘", \
+        find_session(name_gn, pnl, list_node=l2, panel_right=PANEL[2])
+
+    # 没有 WindowControl 时：头部行里只有成员数 → 不能被当成名字（之前真 bug：正则把它删成空串）
+    no_wrap = [n(0, -1, 0, "PaneControl", PANEL),
+               n(1, 0, 1, "GroupControl", (520, 260, 833, 1165)),
+               n(2, 0, 1, "GroupControl", (742, 217, 2225, 1232)),
+               n(3, 2, 2, "GroupControl", LIST, aid="ml-root"),
+               n(4, 2, 2, "TextControl", (1031, 237, 1084, 263), text="(423)"),
+               n(5, 2, 2, "TextControl", (900, 205, 1060, 231), text="另一个群名")]
+    pnl2, _ = pane_bounds(no_wrap, PANEL)
+    l3 = find_message_list(no_wrap, pnl2)
+    got = find_session(no_wrap, pnl2, list_node=l3, panel_right=PANEL[2])
+    assert got == "另一个群名", got
 
     # 空树 / 后台状态
     assert build_turns([], pane_left=0) == []
