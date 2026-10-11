@@ -35,16 +35,19 @@ TREE_BUDGET = 80000      # 节点上限，防止异常布局把子进程拖死
 TREE_DEPTH = 60
 TINY_TREE = 40           # 少于这么多节点 = 多半是「后台窗口只有 9 个节点」那种状态
 REVIVE_WAIT = 0.8        # 等 Chromium 把无障碍树建出来（社区实测 800ms）
+READ_INTERVAL = 1.2      # 两次读树的最小间隔（秒）：读一次要几百 ms，不能每 50ms 跑一遍
+USER_ACTIVE_GRACE = 1.5  # 人在打字/动鼠标的这段时间内不去抢焦点（秒）
+
+
+class _LASTINPUTINFO(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
 
 
 def _click_box(rect: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
     """把输入区矩形收一下再交给父进程点：容器可能把下面的工具栏一起包住（实测高度 259），
-    取上 60% 保证中心点落在打字区而不是工具栏按钮上。"""
+    所以永远取**上 60%**，保证中心点落在打字区而不是工具栏按钮上（与缩放/最大化无关）。"""
     l, t, r, b = rect
-    h = b - t
-    if h > 200:
-        b = t + int(h * 0.6)
-    return (l, t, r, b)
+    return (l, t, r, t + max(20, int((b - t) * 0.6)))
 
 
 class UiaQqntCollector(BaseCollector):
@@ -53,10 +56,13 @@ class UiaQqntCollector(BaseCollector):
                                 can_insert=True, needs_foreground=True)
 
     def __init__(self, hwnd, emit, debug_on=None, app=None, *,
-                 selectors=None, focus_policy="steal"):
+                 selectors=None, focus_policy="steal",
+                 read_interval=READ_INTERVAL, user_grace=USER_ACTIVE_GRACE):
         super().__init__(hwnd, emit, debug_on)
         self.sel = selectors or sel_from(None)
         self.focus_policy = focus_policy or "steal"
+        self.read_interval = float(read_interval)
+        self.user_grace = float(user_grace)
         self.seen: list[tuple[str, str, str | None]] = []
         self.title = ""
         self.last_area = None
@@ -65,6 +71,20 @@ class UiaQqntCollector(BaseCollector):
         self._auto = None
         self._noted: set[str] = set()
         self._prev_foreground = None
+        self._last_read = 0.0
+
+    @staticmethod
+    def _user_idle_seconds() -> float:
+        """距离上一次键鼠输入多久了（秒）。拿不到就当成用户在忙（保守 → 不抢焦点）。"""
+        info = _LASTINPUTINFO()
+        info.cbSize = ctypes.sizeof(_LASTINPUTINFO)
+        try:
+            if not u32.GetLastInputInfo(ctypes.byref(info)):
+                return 0.0
+            now = k32.GetTickCount()
+            return max(0.0, (now - info.dwTime) / 1000.0)
+        except Exception:
+            return 0.0
 
     # ---------------------------------------------------------------- 生命周期
 
@@ -171,13 +191,24 @@ class UiaQqntCollector(BaseCollector):
     # ---------------------------------------------------------------- 每拍
 
     def poll(self, emit) -> None:
+        # 0. 限速：读一棵树要几百毫秒（+ 等建树 0.8s），不能跟着 worker 的 50ms 循环跑。
+        #    注意：worker 是每拍调一次 poll，这里自己管节流。
+        now = time.monotonic()
+        if now - self._last_read < self.read_interval:
+            return
+
         # 1. 前台策略
         if not self._is_foreground():
             if self.focus_policy == "foreground":
+                self._last_read = now
                 self._note_once("bg", "QQ 不在前台——想让它读消息，切到 QQ 窗口，"
                                       "或在设置里把「QQ 读取方式」改成允许短暂置前。")
                 return
+            # 抢焦点会打断打字：人刚动过键鼠就先不抢，下一拍再说。
+            if self._user_idle_seconds() < self.user_grace:
+                return
             self._bring_forward()
+        self._last_read = now
 
         try:
             nodes = self._read_tree()
@@ -306,7 +337,8 @@ if __name__ == "__main__":
 
     events: list = []
     emit = lambda kind, *p: events.append((kind,) + tuple(p))
-    c = UiaQqntCollector(1234, emit, selectors=Selectors(), focus_policy="steal")
+    c = UiaQqntCollector(1234, emit, selectors=Selectors(), focus_policy="steal",
+                         read_interval=0)
     c._is_foreground = lambda: True          # 不碰真实焦点
     c._window_origin = lambda: (0, 0)
     c.start()
@@ -314,7 +346,9 @@ if __name__ == "__main__":
     kinds = [e[0] for e in events]
     assert kinds == ["resumed", "chat", "area", "input", "lines"], kinds
     assert events[1] == ("chat", "甲方"), events[1]
-    assert events[3] == ("input", (900, 1000, 2000, 1080)), events[3]
+    assert events[3] == ("input", (900, 1000, 2000, 1048)), events[3]   # 上 60%（点中心落在打字区）
+    _l, _t, _r, _b = events[3][1]
+    assert _t >= 1000 and _b <= 1080, events[3]                          # 仍在原框之内
     assert events[4][2] == [("her", None, "在吗"), ("me", None, "在的")], events[4]
 
     # 同一棵树再跑一拍：不该重复上报
@@ -340,7 +374,8 @@ if __name__ == "__main__":
     # 后台那种小树 → 提示要用 --force-renderer-accessibility
     state["root"] = Ctrl("PaneControl", (450, 210, 2110, 1170), kids=[Ctrl("GroupControl")])
     events.clear()
-    c2 = UiaQqntCollector(1234, emit, selectors=Selectors(), focus_policy="steal")
+    c2 = UiaQqntCollector(1234, emit, selectors=Selectors(), focus_policy="steal",
+                          read_interval=0)
     c2._is_foreground = lambda: True
     c2._window_origin = lambda: (0, 0)
     c2.start()
@@ -350,7 +385,7 @@ if __name__ == "__main__":
     # 有树但没有类名 → 提示类名对不上
     state["root"] = tree("甲方", ())
     events.clear()
-    c3 = UiaQqntCollector(1234, emit, selectors=Selectors())
+    c3 = UiaQqntCollector(1234, emit, selectors=Selectors(), read_interval=0)
     c3._is_foreground = lambda: True
     c3._window_origin = lambda: (0, 0)
     c3.start()
@@ -359,9 +394,38 @@ if __name__ == "__main__":
 
     # focus_policy=foreground：QQ 不在前台就跳过，且不抢焦点
     events.clear()
-    c4 = UiaQqntCollector(1234, emit, selectors=Selectors(), focus_policy="foreground")
+    c4 = UiaQqntCollector(1234, emit, selectors=Selectors(), focus_policy="foreground",
+                          read_interval=0)
     c4._is_foreground = lambda: False
     c4._bring_forward = lambda: (_ for _ in ()).throw(AssertionError("不该抢焦点"))
     c4.poll(emit)
     assert any(e[0] == "status" and "不在前台" in e[1] for e in events), events
+
+    # 限速：read_interval 内第二次 poll 不重读（否则 worker 的 50ms 循环会把 CPU 和焦点吞光）
+    state["root"] = tree("甲方", (("in", "message-container", "在吗"),))
+    ev2: list = []
+    em2 = lambda kind, *p: ev2.append((kind,) + tuple(p))
+    c5 = UiaQqntCollector(1234, em2, selectors=Selectors(), read_interval=5.0)
+    c5._is_foreground = lambda: True
+    c5._window_origin = lambda: (0, 0)
+    c5.start(); ev2.clear()
+    c5.poll(em2)
+    first = [e[0] for e in ev2]
+    c5.poll(em2)                                   # 立刻再拍：应被节流拦住
+    assert first == ["chat", "area", "input", "lines"], first
+    assert [e[0] for e in ev2] == first, ev2
+
+    # 抢焦点策略：人刚动过键鼠 → 不抢（不打断打字）；空闲下来 → 才抢
+    stolen: list = []
+    c6 = UiaQqntCollector(1234, lambda *a: None, selectors=Selectors(), focus_policy="steal",
+                          read_interval=0, user_grace=1.5)
+    c6._is_foreground = lambda: False
+    c6._bring_forward = lambda: (stolen.append(1), True)[1]
+    c6._read_tree = lambda: []
+    c6._user_idle_seconds = lambda: 0.3            # 人正在打字
+    c6.poll(lambda *a: None)
+    assert not stolen, "人在打字时不该抢焦点"
+    c6._user_idle_seconds = lambda: 3.0            # 人离开了一会儿
+    c6.poll(lambda *a: None)
+    assert stolen, "空闲时应该按 A 策略短暂置前"
     print("uia_qqnt ok")

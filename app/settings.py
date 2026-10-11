@@ -167,6 +167,25 @@ def qq_selectors() -> dict:
     v = _read("qq_selectors")
     return v if isinstance(v, dict) else {}
 
+
+def qq_poll_seconds() -> float:
+    """两次读 QQ 无障碍树的最小间隔（秒）。读一次要几百 ms + 等建树 0.8s，
+    跟着采集循环的 50ms 跑会把 CPU 吃光。默认 1.2s。"""
+    try:
+        v = float(_read("qq_poll_seconds", 1.2))
+    except (TypeError, ValueError):
+        return 1.2
+    return max(0.3, min(30.0, v))
+
+
+def qq_user_grace_seconds() -> float:
+    """人在打字/动鼠标的这段时间内不去抢 QQ 焦点（秒）。0 = 关掉这个保护。默认 1.5s。"""
+    try:
+        v = float(_read("qq_user_grace_seconds", 1.5))
+    except (TypeError, ValueError):
+        return 1.5
+    return max(0.0, min(30.0, v))
+
 def _read_env(env_name: str) -> str:
     """进程环境优先；没有就读注册表并带进进程环境，之后 core/ 里按 os.environ 读就有了。"""
     v = os.environ.get(env_name, "").strip()

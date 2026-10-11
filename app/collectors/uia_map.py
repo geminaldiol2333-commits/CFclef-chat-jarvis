@@ -104,21 +104,25 @@ def descendants(nodes: Sequence[Node], root: Node) -> list[Node]:
 
 
 def pane_bounds(nodes: Sequence[Node], panel_rect: tuple[int, int, int, int]) -> tuple[int, int]:
-    """聊天区（右半区）的左右边界。
+    """聊天区的左右边界 `(left, right)`，**与窗口尺寸/缩放无关**。
 
-    QQ 的布局是 [竖排图标栏][会话列表][聊天区]。会话列表和聊天区都是一整条「窄高容器」，
-    所以取这些窄高容器里最宽的那个当会话列表，它的右边界 +1 就是聊天区左边界。
-    找不到就退回面板宽度的 22%（QQ 默认会话列表宽度就在这个量级）。
+    QQ 的布局是 [竖排图标栏][会话列表][聊天区]，每层都是一个「整高容器」。
+    其中宽度占面板 >40% 的值有两个：把会话列表+聊天区一起包住的容器，和聊天区自己。
+    两者取**左边缘更靠右的那个**就是聊天区（实测：包裹容器 left=520，聊天区 left=832）。
+    窗口拉伸/最大化时这些容器跟着变，但这是相对判断，不受影响。
+    实在找不到就按比例切（面板宽度的 22%，QQ 默认会话列表就在这个量级）。
     """
     pl, pt, pr, pb = panel_rect
     if pb <= pt or pr <= pl:
         return pl, pr
-    tall = [n for n in nodes
-            if n.type == "GroupControl" and n.has_geo
-            and n.height > 0.6 * (pb - pt) and n.width < 0.6 * (pr - pl)]
-    if tall:
-        left = max(tall, key=lambda n: n.width)
-        return left.rect[2], pr          # 会话列表右缘 = 聊天区左缘（实测 833，聊天区从 832 开始）
+    wide_enough = 0.4 * (pr - pl)
+    full_height = [n for n in nodes
+                  if n.type in ("GroupControl", "WindowControl", "PaneControl") and n.has_geo
+                  and n.height > 0.55 * (pb - pt) and n.width >= wide_enough
+                  and n.rect[0] > pl]
+    if full_height:
+        chat = max(full_height, key=lambda n: n.rect[0])   # 左边缘最靠右的那个 = 聊天区
+        return chat.rect[0], chat.rect[2]
     return pl + int((pr - pl) * 0.22), pr
 
 
@@ -150,7 +154,8 @@ def find_message_list(nodes: Sequence[Node], pane_left: int) -> Node | None:
 
     本机实测：QQ 9.9.x 把 CSS 类名从无障碍树里拿掉了，但保留了 `ml-root` 这个 id，
     它下面的子树装了所有消息（386 个节点 / 134 个文本节点）。
-    没有这个 id 时的兜底：聊天区里“子树文本节点最多”的那个容器。"""
+    没有这个 id 时的兜底：聊天区里“子树文本节点最多”的那个容器。
+    """
     hit = find_first(nodes, SEL_DEFAULT.message_list, with_geo=True)
     if hit is not None:
         return hit
@@ -158,10 +163,26 @@ def find_message_list(nodes: Sequence[Node], pane_left: int) -> Node | None:
              and n.type in ("GroupControl", "WindowControl", "PaneControl")]
     best, best_score = None, 0
     for n in cands:
-        texts = [d for d in descendants(nodes, n) if d.type == "TextControl" and d.text.strip()]
+        texts = [d for d in descendants(nodes, n) if d.type == "TextControl" and d.has_text]
         if len(texts) > best_score:
             best, best_score = n, len(texts)
     return best if best_score >= 3 else None
+
+
+def _pad(pane_width: int) -> int:
+    """边界容差：按面板宽度取比例，别写死像素（拉伸/缩放/高 DPI 下才准）。"""
+    return max(6, int(pane_width * 0.012))
+
+
+def _rows_by_y(nodes: Sequence[Node], gap: int) -> list[list[Node]]:
+    """把一批节点按 y 聚成行（相邻行距 ≤ gap）。"""
+    rows: list[list[Node]] = []
+    for n in sorted(nodes, key=lambda n: (n.rect[1], n.rect[0])):
+        if rows and n.rect[1] - rows[-1][0].rect[1] <= gap:
+            rows[-1].append(n)
+        else:
+            rows.append([n])
+    return rows
 
 
 def find_session_node(nodes: Sequence[Node], pane_left: int, sel: Selectors = SEL_DEFAULT,
@@ -181,16 +202,16 @@ def find_session_node(nodes: Sequence[Node], pane_left: int, sel: Selectors = SE
              and n.rect[0] >= pane_left - PANE_TOL and n.rect[2] <= (panel_right or 10 ** 9)]
     if not above:
         return None
-    # 只要「紧贴消息列表上方」那一条（80px 以内）：再往上是标题栏和窗口按钮（实测 y=225 那里有个 1 字符的按钮）
-    band = [n for n in above if n.rect[1] >= list_node.rect[1] - 80]
-    if band:
-        above = band
-    # 头部里最左边那条通常就是会话名；实在只有单字符时再退回去
-    longer = [n for n in above if len(n.text.strip()) >= 2]
+    # 取「最靠近消息列表顶部的那一行」——与缩放/最大化无关，
+    # 比写死「上方 80px」稳：再往上是标题栏和窗口按钮（实测那里有个 1 字符按钮）。
+    heights = sorted(n.height for n in above)
+    gap = max(4, int(0.6 * heights[len(heights) // 2]))
+    rows = _rows_by_y(above, gap)
+    row = rows[-1]                                  # 最下面那行 = 紧贴消息列表上方
+    longer = [n for n in row if len(n.text.strip()) >= 2]
     if longer:
-        above = longer
-    top = min(n.rect[1] for n in above)
-    return min((n for n in above if n.rect[1] <= top + 8), key=lambda n: n.rect[0])
+        row = longer
+    return min(row, key=lambda n: n.rect[0])
 
 
 def find_session(nodes: Sequence[Node], pane_left: int, sel: Selectors = SEL_DEFAULT,
@@ -213,11 +234,16 @@ def find_editor(nodes: Sequence[Node], pane_left: int, sel: Selectors = SEL_DEFA
         return None
     right = panel_right or 10 ** 9
     pane_width = max(1, right - pane_left) if panel_right else max(1, list_node.width)
+    tol = _pad(pane_width)
+    # 输入区高度按「消息列表高度」取相对区间（实测：列表高 582 → 输入区 139、工具栏 70）
+    min_h = max(24, int(0.10 * list_node.height))
+    max_h = max(min_h + 1, int(0.50 * list_node.height))
     below = [n for n in nodes
              if n.type == "GroupControl" and n.has_geo
-             and n.rect[1] >= list_node.rect[3] - 2 and n.rect[0] >= pane_left - PANE_TOL
-             and n.rect[2] <= right and 60 <= n.height <= 320
-             and n.width >= 0.55 * pane_width]          # 工具栏只有半宽，输入区是整宽
+             and n.rect[1] >= list_node.rect[3] - tol and n.rect[0] >= pane_left - tol
+             and n.rect[2] <= right + tol
+             and n.height >= min_h and n.height <= max_h
+             and n.width >= 0.55 * pane_width]        # 工具栏只有半宽，输入区是整宽
     # 紧贴在消息列表下面那块整宽容器就是输入区（它下面那行是工具栏）。
     # 更准的信号：输入区里含「已输入的文字」，所以优先取含文本的那块（取了其中面积最小的，
     # 避开把输入区和工具栏一起包住的父容器）。
@@ -229,20 +255,17 @@ def find_editor(nodes: Sequence[Node], pane_left: int, sel: Selectors = SEL_DEFA
     return min(below, key=lambda n: n.rect[1]) if below else None
 
 
-def _text_rows(nodes: Sequence[Node], box: tuple[int, int, int, int], gap: int = 8):
-    """把矩形范围内的文本节点按 y 聚成行（同一行 y 差 ≤ gap）。"""
+def _text_rows(nodes: Sequence[Node], box: tuple[int, int, int, int], gap: int = 0):
+    """把矩形范围内的文本节点按 y 聚成行；gap 和边界容差都按尺寸算，不写死像素。"""
     l, t, r, b = box
+    pad = _pad(max(1, r - l))
     inside = [n for n in nodes if n.type == "TextControl" and n.has_text and n.has_geo
-              and n.rect[0] >= l - PANE_TOL and n.rect[2] <= r + PANE_TOL
-              and n.rect[1] >= t - PANE_TOL and n.rect[3] <= b + PANE_TOL]
-    inside.sort(key=lambda n: (n.rect[1], n.rect[0]))
-    rows: list[list[Node]] = []
-    for n in inside:
-        if rows and n.rect[1] - rows[-1][0].rect[1] <= gap:
-            rows[-1].append(n)
-        else:
-            rows.append([n])
-    return rows
+              and n.rect[0] >= l - pad and n.rect[2] <= r + pad
+              and n.rect[1] >= t - pad and n.rect[3] <= b + pad]
+    if not gap and inside:
+        hs = sorted(n.height for n in inside)
+        gap = max(4, int(0.6 * hs[len(hs) // 2]))
+    return _rows_by_y(inside, gap or 8)
 
 
 def build_turns_from_rows(nodes: Sequence[Node], list_node: Node,
@@ -374,7 +397,7 @@ if __name__ == "__main__":
         n(9, 0, 1, "ButtonControl", (1905, 210, 2110, 260), text="切换为经典模式"),
     ]
     pane_left, _ = pane_bounds(rich, PANEL)
-    assert pane_left == 833, pane_left
+    assert pane_left == 833, pane_left          # 这份 fixture 里聊天区容器从 833 开始
     assert detect_mode(rich) == "efficiency", detect_mode(rich)
     assert find_session(rich, pane_left) == "甲方"
     ed = find_editor(rich, pane_left)
@@ -407,7 +430,7 @@ if __name__ == "__main__":
         n(11, 2, 2, "GroupControl", (832, 1095, 1880, 1165)),                 # 工具栏
     ]
     pane_left, _ = pane_bounds(real, PANEL)
-    assert pane_left == 833, pane_left
+    assert pane_left == 832, pane_left          # 聊天区自己那块容器的左边缘（实测 832）
     lst = find_message_list(real, pane_left)
     assert lst is not None and lst.rect == (832, 325, 1880, 907), lst
     assert find_session(real, pane_left, list_node=lst, panel_right=PANEL[2]) == "甲方"
@@ -427,8 +450,79 @@ if __name__ == "__main__":
     assert find_session(bare, 834) == ""
     assert build_turns(bare, pane_left=834, list_node=None) == []
 
+    # ── 拉伸 / 最大化 / 不同缩放：同一套规则必须都定位对 ──────────────────
+    def layout(win, scale=1.0, session_frac=0.24, n_her=5, n_me=3):
+        """按给定窗口尺寸/缩放，造一棵与真实结构同形的树（app 根 / 包裹容器 / 会话列表 / 聊天区）。"""
+        l, t, r, b = win
+        W = r - l
+        S = lambda v: int(round(v * scale))                      # noqa: E731
+        rail_w, top, head = S(70), S(50), S(45)
+        rail = (l + S(5), t + top, l + S(5) + rail_w, b - S(5))
+        sess = (rail[2], t + top, rail[2] + int(W * session_frac), b - S(5))
+        chat = (sess[2], t + top, r - S(5), b - S(5))
+        content = (sess[0], t + top, r - S(5), b - S(5))
+        list_t = chat[1] + head + S(15)
+        composer_h, toolbar_h = S(140), S(70)
+        list_b = chat[3] - composer_h - toolbar_h - S(20)
+        comp_t = list_b + S(49)
+        last = max(1, n_her + n_me)
+        pitch = max(S(30), ((list_b - list_t) - S(16)) // last)   # 行距按可用高度算，保证不越界
+        text_h = min(S(24), pitch - S(4))
+        out = [n(0, -1, 0, "PaneControl", (l, t, r, b)),
+               n(1, 0, 1, "GroupControl", (l, t, r, b)),            # app 根：贴着面板左边缘
+               n(2, 0, 1, "GroupControl", rail),
+               n(3, 0, 1, "GroupControl", content),                  # 包裹容器：很宽但 left 更小
+               n(4, 0, 1, "GroupControl", sess),
+               n(5, 0, 1, "GroupControl", chat),                     # 聊天区：left 最大
+               n(6, 5, 2, "TextControl", (chat[0] + S(20), t + S(12), chat[0] + S(60), t + S(38)),
+                 text="QQ"),                                         # 标题栏（应被排除）
+               n(7, 5, 2, "TextControl", (chat[0] + S(23), chat[1] + S(8), chat[0] + S(163), chat[1] + S(38)),
+                 text="会话名甲乙丙"),                                  # 头部（最靠近消息列表上方）
+               n(8, 5, 2, "GroupControl", (chat[0], list_t, chat[2], list_b), aid="ml-root"),
+               n(9, 5, 2, "GroupControl", (chat[0] + S(20), list_b + S(9), chat[0] + S(360), list_b + S(50)),
+                 aid="func-bar-shortcuts-left"),                      # 半宽工具条
+               n(10, 5, 2, "GroupControl", (chat[0], comp_t, chat[2], comp_t + composer_h)),
+               n(11, 10, 3, "TextControl", (chat[0] + S(20), comp_t + S(40), chat[0] + S(300), comp_t + S(62)),
+                 text="草稿"),                                        # 输入区里的草稿
+               n(12, 5, 2, "GroupControl", (chat[0], comp_t + composer_h, chat[2], chat[3]))]
+        for k in range(n_her):
+            y = list_t + S(16) + k * pitch
+            out.append(n(20 + k, 8, 3, "TextControl",
+                         (chat[0] + S(88), y, chat[0] + S(400), y + text_h), text=f"对方第{k}句"))
+        for k in range(n_me):
+            y = list_t + S(16) + (n_her + k) * pitch
+            out.append(n(30 + k, 8, 3, "TextControl",
+                         (chat[2] - S(320), y, chat[2] - S(20), y + text_h), text=f"我第{k}句"))
+        return out, chat, list_t, list_b, comp_t, composer_h
+
+    cases = [
+        ("125% 缩放（本机实测）", {"win": (450, 210, 2110, 1170), "scale": 1.25}),
+        ("100% 缩放", {"win": (0, 0, 1440, 900), "scale": 1.0}),
+        ("最大化 2560x1400", {"win": (0, 0, 2560, 1400), "scale": 1.0}),
+        ("最大化 @150%", {"win": (0, 0, 2560, 1400), "scale": 1.5}),
+        ("窄窗口 1000x700", {"win": (100, 100, 1100, 800), "scale": 1.0}),
+        ("会话列表被拖宽", {"win": (0, 0, 1920, 1080), "scale": 1.0, "session_frac": 0.42}),
+    ]
+    for label, kw in cases:
+        nodes, chat, list_t, list_b, comp_t, composer_h = layout(**kw)
+        pl, prx = pane_bounds(nodes, (kw["win"][0], kw["win"][1], kw["win"][2], kw["win"][3]))
+        assert pl == chat[0], f"{label}: pane_left={pl} 期望 {chat[0]}"
+        assert prx == chat[2], f"{label}: pane_right={prx} 期望 {chat[2]}"
+        lst = find_message_list(nodes, pl)
+        assert lst is not None and lst.rect == (chat[0], list_t, chat[2], list_b), f"{label}: {lst}"
+        ed = find_editor(nodes, pl, list_node=lst, panel_right=prx)
+        assert ed is not None, f"{label}: 输入区没找到"
+        assert ed.rect[0] >= chat[0] - 20 and ed.rect[3] <= comp_t + composer_h, \
+            f"{label}: 输入区跑到工具栏里了 {ed.rect}"
+        click_y = (ed.rect[1] + ed.rect[3]) // 2
+        assert comp_t <= click_y <= comp_t + composer_h, f"{label}: 点击点 y={click_y} 不在输入区"
+        assert find_session(nodes, pl, list_node=lst, panel_right=prx) == "会话名甲乙丙", label
+        turns = build_turns(nodes, pane_left=pl, list_node=lst)
+        assert [t.who for t in turns] == ["her"] * kw.get("n_her", 5) + ["me"] * kw.get("n_me", 3), \
+            f"{label}: {[t.who for t in turns]}"
+
     # 空树 / 后台状态
     assert build_turns([], pane_left=0) == []
     assert find_editor([], 0) is None
     assert find_message_list([], 0) is None
-    print("uia_map ok")
+    print("uia_map ok（含 6 种尺寸/缩放/最大化用例）")

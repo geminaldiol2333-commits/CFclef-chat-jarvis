@@ -80,9 +80,29 @@ app/settings.py              qq_focus_policy（steal|foreground）、qq_selector
 **无头自测（不需要 QQ、不需要 uiautomation、不开任何窗口）**：
 
 ```bat
-python -m app.collectors.uia_map      :: 合成树：类名可用 / 只有几何 / 空树 / 去重 / 换会话
-python -m app.collectors.uia_qqnt     :: 假 uiautomation 模块：事件流转、去重、换会话、两条提示、前台策略
+python -m app.collectors.uia_map      :: 合成树：类名世界 / 真实 ml-root 结构 / 空树 / 去重 / 换会话
+                                      ::   + 6 种尺寸用例：125%、100%、最大化、最大化@150%、窄窗口、会话列表拖宽
+python -m app.collectors.uia_qqnt     :: 假 uiautomation：事件流转、去重、换会话、两条提示、
+                                      ::   前台策略（人在打字时不抢焦点）、读树限速
 ```
+
+**实机多状态实测**（QQ 9.9.36，会话开着；采完把窗口位置/大小还原）：
+
+| 窗口状态 | 窗口尺寸 | 会话名 | 输入区 | 读到消息 |
+| --- | --- | --- | --- | --- |
+| 普通（125% 缩放） | 1660x960 | len=12 ✓ | `(832,906,1880,1061)` | 7 条（1 我 / 6 对方） |
+| **最大化** | 2578x1398 | len=12 ✓ | `(382,1116,2330,1271)` | 16 条（2 我 / 14 对方） |
+| 拉伸到 1100x820 | 1100x820 | len=12 ✓ | `(500,726,990,809)` | 10 条（1 我 / 9 对方） |
+| 拉伸到 1920x1080 | 1920x1080 | len=12 ✓ | `(502,936,1810,1091)` | 13 条（1 我 / 12 对方） |
+
+会话名在四种状态下都是同一个（len=12）、输入区跟着窗口缩放、消息数随可见区域变化——
+说明定位规则是相对的，没有写死像素。最大化时能看到 2 条「我发的」，也顺便验证了左右对齐判己方。
+
+**聚焦策略（不能每拍都抢焦点）**：读一次树要几百 ms + 等建树 0.8s，所以
+
+- 读树**限速**：两次之间至少 `qq_poll_seconds`（默认 1.2s）；
+- `steal` 模式下用 `GetLastInputInfo` 看键鼠空闲时长：人刚动过（< `qq_user_grace_seconds`，默认 1.5s）
+  **就不抢**，等下一拍——不会在你打字时把焦点抢走。
 
 **对着真实 QQ 校准（只读，不会点击/切换/截图、不含消息文本）**：
 
@@ -102,12 +122,28 @@ python probe\qq_uia_verdict.py qq_tree.json      :: 三条轴：editor / bubbles
 
 | 键 | 默认 | 说明 |
 | --- | --- | --- |
-| `qq_focus_policy` | `steal` | `steal` = 读取时短暂置前、读完还焦点；`foreground` = 只在 QQ 前台时读 |
-| `qq_selectors` | `{}` | 覆盖选择器（QQ 大版本改类名时才需要）：`{"editor": ["qq-msg-editor"], "header": [...], "bubble": [...], "self_mark": [...], "sender": [...]}` |
+| `qq_focus_policy` | `steal` | `steal` = 读取时短暂置前、读完还焦点（人正在打字时不抢）；`foreground` = 只在 QQ 前台时读 |
+| `qq_selectors` | `{}` | 覆盖选择器（QQ 大版本改类名时才需要）：`{"message_list": ["ml-root"], "editor": [...], "header": [...], "bubble": [...], "self_mark": [...], "sender": [...]}` |
+| `qq_poll_seconds` | `1.2` | 两次读树的最小间隔（秒） |
+| `qq_user_grace_seconds` | `1.5` | 人在打字/动鼠标的这段时间内不抢焦点（秒，0 = 关掉） |
 
 设置页「QQ NT（UIA 读取）」卡片里可以改 `qq_focus_policy`。
 
-## 7. 已知限制
+## 8. 手册（uiautomation / Microsoft UIA）里需要注意的几条
+
+- **Electron/Chrome 必须 `--force-renderer-accessibility`**：官方 README 明确写了「Chrome 和基于
+  Electron 的应用需要加这个启动参数才支持 UIAutomation」，不加就只能看到最外层
+  `PaneControl Chrome_WidgetWin_1`。本项目实测完全一致（不加：9 个节点；加了：900 左右）。
+- **非管理员跑 uiautomation 会出 COMError**：官方 README 说 Win7+ 建议以管理员运行 Python，
+  否则很多调用会失败。本项目不要求管理员：QQ 也是普通权限，同级完整性就能读；
+  **但 QQ 若以管理员启动就会读不到**（这是 Windows 的 UIPI 限制，不是本项目的问题）。
+- **布局变化后元素会失效，必须重新查找**：官方例子用 `Refind()`/`Exists()`。本采集器**每次 poll 都
+  `ControlFromHandle(hwnd)` 重建根节点**，所以拉伸/最大化/切会话后拿到的都是新的坐标——
+  实测四种窗口状态下都能定位（见第 5 节）。
+- **`BoundingRectangle` 是物理像素**：所以进程做过 `SetProcessDPIAware()` 才与截图/点击坐标一致；
+  采集子进程和父进程都调了。跨不同缩放比例的显示器拖动窗口时坐标会变，因为每拍重读，所以能跟上。
+
+## 9. 已知限制
 
 - **QQ 必须在前台**（或允许短暂置前）才能读；QQ 最小化时读不到。
 - 群聊发言人名靠「紧贴气泡上方的短文本」推断，气泡列表被虚拟化时可能挂到上一个人头上；
