@@ -243,7 +243,7 @@ def group_fingerprint(nodes: Sequence[Node], list_node: Node | None,
         if m:
             count, member_top = m.group(1), n.rect[1]
             break
-        if (not count and n.rect[1] < list_node.rect[1]
+        if (not count and n.rect[3] <= list_node.rect[1]
                 and COUNT_ONLY.match(n.text.strip())):
             count = re.sub(r"\D", "", n.text)          # 头部那个 (521)
     names: list[str] = []
@@ -289,8 +289,14 @@ def find_session_row(nodes: Sequence[Node], pane_left: int, sel: Selectors = SEL
     if (wrap is not None and wrap.has_text and not COUNT_ONLY.match(wrap.text.strip())
             and not _is_region_label(wrap.text)):
         return [wrap]
+    # 必须**整行都在消息列表上沿以上**（rect[3] <= 列表 top）。
+    # 实测：虚拟列表里被滚上去的消息有一截压在列表上沿下面（奥贝斯坦…的昵称行 y=264..284、
+    # “[转发消息]” y=266..286、LV/100/王者 徒标 y=265..282），以前它们会冒充头部，
+    # 会话名就在“群 97 人 · …”/“[转发消息]”/“小布 119712LV94王者”之间自己来回变；
+    # 真正的头部“(97)”始终在列表上方 18px 处（y=237..263 ≤ 281）。
+    top = list_node.rect[1]
     above = [n for n in nodes if n.type == "TextControl" and n.has_text
-             and n.has_geo and n.rect[1] < list_node.rect[1]
+             and n.has_geo and n.rect[3] <= top
              and n.rect[0] >= pane_left - PANE_TOL and n.rect[2] <= (panel_right or 10 ** 9)]
     # 成员数、单字符 UI 碎片不是名字（除非实在没别的）
     useful = [n for n in above if not COUNT_ONLY.match(n.text.strip()) and len(n.text.strip()) > 1]
@@ -953,6 +959,27 @@ if __name__ == "__main__":
 
     # 有名字的 WindowControl 依旧优先（这条不能被指纹抢走）
     assert find_session(name_gn, pnl, list_node=l2, panel_right=PANEL[2]) == "高速网盘"
+
+    # ── 被滚上去的消息不能冒充头部（实测：会话名在“群 97 人…”/“[转发消息]”之间自己变）──
+    # 真头部 (97) 在 y=237..263（下端 263 ≤ 列表上沿 281）；冒充者都是被列表上沿切掉一截的：
+    # 昵称行 y=264..284、徒标 y=265..282、“[转发消息]” y=266..286。
+    intruders = region + [n(20, 5, 3, "TextControl", (817, 264, 971, 284), text="奥贝斯坦(零氪)306430"),
+                          n(21, 5, 3, "TextControl", (844, 266, 915, 286), text="[转发消息]"),
+                          n(22, 5, 3, "TextControl", (980, 265, 995, 282), text="LV"),
+                          n(23, 5, 3, "TextControl", (994, 265, 1017, 282), text="100")]
+    pnl7, _ = pane_bounds(intruders, PANEL)
+    l8 = find_message_list(intruders, pnl7)
+    got = find_session(intruders, pnl7, list_node=l8, panel_right=2223)
+    assert got == "群 521 人", got
+    assert "转发" not in got and "奥贝斯坦" not in got, got
+    assert find_session_row(intruders, pnl7, list_node=l8, panel_right=2223)[0].text.strip() == "(521)", \
+        "压在列表上沿下面的消息行不能当头部"
+    # 头部有真名字时也不能被冒充者顶掉
+    named = intruders + [n(24, 3, 2, "TextControl", (1031, 237, 1084, 263), text="高速网盘")]
+    pnl8, _ = pane_bounds(named, PANEL)
+    l9 = find_message_list(named, pnl8)
+    assert find_session(named, pnl8, list_node=l9, panel_right=2223) == "高速网盘", \
+        find_session(named, pnl8, list_node=l9, panel_right=2223)
 
     # 空树 / 后台状态
     assert build_turns([], pane_left=0) == []
