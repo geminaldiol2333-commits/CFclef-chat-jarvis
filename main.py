@@ -147,6 +147,13 @@ def analyze_bg(msgs, title, revision, reply_to=None):
             jev_base = mgr.ensure("clef")
         if _is_local("draft") and not judge_only:
             draft_base = mgr.ensure("draft")
+        # 多模态：把对方发来的图（图片/表情包那些占位消息带的像素）喂给判断模型。
+        # 只在配了 mmproj 并开启 perceive_media 时才有；不配就只发占位文字。
+        files = None
+        if settings.perceive_media():
+            picked = [m[3] for m in msgs[-settings.context():]
+                      if len(m) > 3 and m[3] and m[0] == "her"]
+            files = picked[-2:] or None
         results.put(("ok", analyze(msgs, settings.relationship(), context=settings.context(),
                                    model=settings.draft_model() or None,
                                    provider=settings.draft_provider(),
@@ -156,7 +163,8 @@ def analyze_bg(msgs, title, revision, reply_to=None):
                                    jev_provider=settings.jev_provider(),
                                    jev_model=settings.jev_model() or None,
                                    jev_base_url=jev_base,
-                                   group_judge_only=judge_only),
+                                   group_judge_only=judge_only,
+                                   files=files),
                      title, revision))
     except Exception as e:
         results.put(("err", f"{T('分析失败: ')}{e}", title, revision))
@@ -274,8 +282,10 @@ def drain():
         chat["rev"] += 1  # 这个会话有新消息了，它在跑的分析作废
         if title == ov.current_chat():  # 看的是别的会话就别把人家的候选划掉
             ov.invalidate_replies()
-        for who, name, text in new:
-            chat["history"].append((who, text, name))
+        for item in new:
+            who, name, text = item[0], item[1], item[2]
+            media = item[3] if len(item) > 3 else None      # (mime, bytes)，给多模态判断用
+            chat["history"].append((who, text, name, media))
             ov.log_message(who, text, name, chat=title)
             if who == "her" and name:  # 群里发过言的人，去重后最近的排最前
                 if name in chat["senders"]:

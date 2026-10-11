@@ -247,6 +247,9 @@ hf download ggml-org/Clef-Flash-GGUF Clef-Flash-Q8_0.gguf --local-dir D:\AI_Tool
 | `local_idle_unload` | `true` | 空闲卸载 |
 | `local_idle_seconds` | `300` | 空闲多少秒后卸载（30–86400） |
 | `check_update` | `false` | 启动时查 GitHub 版本号（本 fork 默认关） |
+| `local_clef_mmproj` | `""` | clef 的多模态投影器（mmproj）路径；填了判断模型才能看图 |
+| `perceive_media` | 默认跟随 mmproj | 要不要把非文字消息（图片/表情包）的像素喂给判断模型 |
+| `group_judge_only` | `true` | 群聊只给判断、不起草候选 |
 
 ## 支持的聊天软件
 
@@ -267,6 +270,10 @@ hf download ggml-org/Clef-Flash-GGUF Clef-Flash-Q8_0.gguf --local-dir D:\AI_Tool
 | --- | --- |
 | 单聊 | 判断 → 起草 3 条候选 → 排序，点「填入」 |
 | **群聊** | **只给判断摘要，不起草候选**，也不会去加载起草模型。群里可能十几个人同时在聊三四件不相关的事，一条「下一句」没有意义。设置页「群聊只给判断，不起草」可关（只有开一个话题的小群才建议关） |
+
+非文字消息（图片 / 表情包 / 语音 / 视频 / 文件 / 红包…）在上下文里给**占位**（`[图片]` 这类）
+而不是直接消失；配了 clef 的 **mmproj** 之后，这些占位还会把图一起喂给判断模型
+（多模态判断，Clef-Omni 那种模型直接受益）。
 
 1. **必须带 `--force-renderer-accessibility` 启动 QQ**（不带的话它的聊天内容根本不在无障碍树里，
    什么都读不到）。最省事：双击 `scripts\restart-qq-with-a11y.bat`——它会关掉 QQ 再带开关重新启动

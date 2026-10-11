@@ -327,8 +327,52 @@ def _glyph_gap(texts: Sequence[Node]) -> int:
     return max(4, int(0.6 * hs[len(hs) // 2])) if hs else 8
 
 
+# 非文字消息的占位文案。顺序有意义（先匹配到的先用）；关键词来自 QQ 给附件节点起的名字。
+NONTEXT_LABELS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("语音", "语音消息"), "[语音]"),
+    (("视频",), "[视频]"),
+    (("聊天记录", "合并转发"), "[聊天记录]"),
+    (("文件", "文档"), "[文件]"),
+    (("红包",), "[红包]"),
+    (("转账",), "[转账]"),
+    (("位置", "位置分享"), "[位置]"),
+    (("音乐", "歌曲"), "[音乐]"),
+    (("名片",), "[名片]"),
+    (("链接", "分享"), "[链接]"),
+)
+STICKER_MAX_FRAC = 0.25      # 图片宽度不到列表宽度的这个比例且接近方形 → 当表情包
+
+
+def placeholder_for(sub: Sequence[Node], media: Sequence[Node], list_width: int) -> str | None:
+    """非文字消息的占位文案；认不出是哪种就 `[非文字消息]`；什么都没有（只有名字行）返回 None。"""
+    for n in sub:
+        t = (n.text or "").strip()
+        if not t or len(t) > 16:
+            continue
+        for keys, label in NONTEXT_LABELS:
+            if any(k in t for k in keys):
+                return label
+    if media:
+        widest = max(n.width for n in media)
+        tallest = max(n.height for n in media)
+        if (widest <= STICKER_MAX_FRAC * max(1, list_width)
+                and abs(widest - tallest) <= 0.35 * max(widest, tallest, 1)):
+            return "[表情包]"
+        return "[图片]"
+    return None
+
+
+def _anchor_center(primary: Sequence[Node], fallback: Sequence[Node]) -> float | None:
+    """一组节点的水平中心（优先用有几何的；都没有再试 fallback）。"""
+    geo = [n for n in primary if n.has_geo] or [n for n in fallback if n.has_geo]
+    if not geo:
+        return None
+    return (min(n.rect[0] for n in geo) + max(n.rect[2] for n in geo)) / 2
+
+
 def turns_from_containers(nodes: Sequence[Node], list_node: Node,
-                          sel: Selectors = SEL_DEFAULT) -> list[Turn]:
+                          sel: Selectors = SEL_DEFAULT,
+                          anchors: list | None = None) -> list[Turn]:
     """按消息容器读消息——有群等级/群头衔这类高特征文本时最可靠的一条路。
 
     每个容器里的文本按 y 聚行：
@@ -341,7 +385,12 @@ def turns_from_containers(nodes: Sequence[Node], list_node: Node,
 
     名字行的另一个作用：QQ 只在**发言人变化时**才显示昵称，所以没名字行的容器就继承
     上一个容器的发言人（几何对得上才继承，对不上就按几何算）。
-    居中的（±8% 宽）当系统提示丢掉；没正文的（图片/表情包）会自然跳过。
+    居中的（±8% 宽）当系统提示丢掉。
+
+    **非文字消息给占位**：图片/表情包/语音/视频/文件/红包/转账/位置…… 都变成一条
+    `[图片]` 这类占位消息，而不是直接消失——群里上下文不会因此断掉。
+    anchors 非 None 时，会按 turn 顺序把「这条消息对应的媒体节点」（图片控件；没有就是 None）
+    填进去，给上层去截图交给多模态模型（Clef-Omni 预留）。
 
     ponytail: 只读“全部子文本都有几何”的容器（已渲染的）；虚拟列表滑出去的项几何全为 0，
     直接跳过，不猜。
@@ -354,15 +403,23 @@ def turns_from_containers(nodes: Sequence[Node], list_node: Node,
     prev_who: str | None = None
     prev_name: str | None = None
     for c in message_containers(nodes, list_node):
-        texts = [t for t in descendants(nodes, c)
-                 if t.type == "TextControl" and t.has_text and t.has_geo]
-        if not texts:
+        sub = descendants(nodes, c)
+        texts = [t for t in sub if t.type == "TextControl" and t.has_text and t.has_geo]
+        media = [t for t in sub if t.type == "ImageControl" and t.has_geo]
+        if not texts and not media:
             continue                     # 没布局的容器整条跳过，不猜
-        rows = _rows_by_y(texts, _glyph_gap(texts))
-        # 只有一行、而且这一行不止一段（昵称+徽标）→ 「有名字没正文」：图片/表情包/纯转发，跳过
-        if len(rows) == 1 and len(rows[0]) >= 2:
-            continue
+        rows = _rows_by_y(texts, _glyph_gap(texts)) if texts else []
         name, body_rows = None, rows
+        # 只有一行、而这行上除了头那串还有更短、更深的段（徽标）→ 这是「名字行 + 徽标」
+        # 而没有单独的正文行：图片/表情包/合并转发就长这样，不能当正文读。
+        if len(rows) == 1:
+            row = rows[0]
+            shallow = min(n.depth for n in row)
+            deeper = [n for n in row if n.depth > shallow]
+            if deeper and all(len(n.text.strip()) <= 4 for n in deeper):
+                name = "".join(n.text.strip() for n in sorted(
+                    (n for n in row if n.depth == shallow), key=lambda n: n.rect[0])).strip() or None
+                body_rows = []
         for k, row in enumerate(rows):
             if k == len(rows) - 1:
                 break                    # 最后一行留给正文
@@ -379,10 +436,17 @@ def turns_from_containers(nodes: Sequence[Node], list_node: Node,
                 break
         body = "".join(n.text.strip() for r in body_rows
                        for n in sorted(r, key=lambda n: n.rect[0])).strip()
-        if not body:
+        media_source = max(media, key=lambda n: n.width * n.height) if media else None
+        if body:
+            anchor = [n for r in body_rows for n in r]
+        else:
+            label = placeholder_for(sub, media, list_node.width)
+            if label is None:
+                continue                 # 只有名字行（没正文也没附件）→ 跳过
+            body, anchor = label, list(media)
+        cx = _anchor_center(anchor, body_rows[0] if body_rows else texts)
+        if cx is None:
             continue
-        flat = [n for r in body_rows for n in r]
-        cx = (min(n.rect[0] for n in flat) + max(n.rect[2] for n in flat)) / 2
         if abs(cx - mid) <= 0.08 * width:
             continue                     # 居中 = 系统提示（入群/撤回/公告）
         who = "me" if cx > mid else "her"
@@ -391,6 +455,8 @@ def turns_from_containers(nodes: Sequence[Node], list_node: Node,
         elif who == "me":
             name = None                          # 自己那条上的昵称/头衔不当“对方名字”用
         turns.append(Turn(who=who, text=body, name=name))
+        if anchors is not None:
+            anchors.append(media_source)
         prev_who, prev_name = who, name
     return turns
 
@@ -451,12 +517,16 @@ def _sender_name(nodes: Sequence[Node], bubble: Node, sel: Selectors) -> str | N
 
 
 def build_turns(nodes: Sequence[Node], sel: Selectors = Selectors(), *,
-                pane_left: int = 0, list_node: Node | None = None) -> list[Turn]:
+                pane_left: int = 0, list_node: Node | None = None,
+                anchors: list | None = None) -> list[Turn]:
     """气泡节点 → Turn 列表（按 DOM 顺序 = 时间顺序）。三条路径，从准到糙：
 
       1. 类名路径（气泡/己方标记存在）——最准，其他 QQ 构建/以后可能又能用；
-      2. 消息容器路径（本机群聊实测可用：名字/徽标/正文分层清楚）；
+      2. 消息容器路径（本机实测可用：名字/徽标/正文分层清楚，非文字消息给占位）；
       3. 按 y 聚行的几何路径（最后手，容易把界面元素当消息）。
+
+    anchors 非 None 时，按 turn 顺序填「这条消息对应的媒体节点」（没媒体就是 None）——
+    上层用它去截图，以后交给多模态模型（Clef-Omni）。
     """
     bubbles = [n for n in nodes if any(x in n.key for x in sel.bubble)]
     if bubbles:
@@ -472,24 +542,32 @@ def build_turns(nodes: Sequence[Node], sel: Selectors = Selectors(), *,
             who = "me" if any(x in b.key for x in sel.self_mark) else "her"
             name = _sender_name(nodes, b, sel) if who == "her" else None
             turns.append(Turn(who=who, text=text, name=name))
+            if anchors is not None:
+                anchors.append(None)
         return turns
     if list_node is not None:
-        turns = turns_from_containers(nodes, list_node, sel)
+        turns = turns_from_containers(nodes, list_node, sel, anchors=anchors)
         if turns:
             return turns
-        return build_turns_from_rows(nodes, list_node, sel)
+        rows_turns = build_turns_from_rows(nodes, list_node, sel)
+        if anchors is not None:
+            anchors.extend([None] * len(rows_turns))
+        return rows_turns
     return []
 
 
 def new_turns(seen: list[tuple[str, str, str | None]], turns: Sequence[Turn],
-              similar) -> list[Turn]:
-    """增量：只留下没见过的（滚动/重绘不重复上报）。similar 传 app.ocr.similar，避免循环依赖。"""
+              similar, indices: list | None = None) -> list[Turn]:
+    """增量：只留下没见过的（滚动/重绘不重复上报）。similar 传 app.textsim.similar。
+    indices 非 None 时，按顺序填回「这条在 turns 里的下标」——上层用它去拿对应的媒体锚点。"""
     fresh = []
-    for t in turns:
+    for k, t in enumerate(turns):
         hit = any(w == t.who and similar(old, t.text) for w, old, _ in seen)
         if not hit:
             fresh.append(t)
             seen.append((t.who, t.text, t.name))
+            if indices is not None:
+                indices.append(k)
     del seen[:-500]
     return fresh
 
@@ -661,12 +739,16 @@ if __name__ == "__main__":
           n(2, 0, 1, "GroupControl", (742, 217, 2225, 1232)),
           n(3, 2, 2, "GroupControl", LIST, aid="ml-root")]
 
-    def add_container(cid, specs, geo=True):
+    def add_container(cid, specs, geo=True, media=()):
+        """specs: (depth, x0, y, x1, text)；media: (x0, y0, x1, y1, name) 的图片控件。"""
         ci = len(gn)
         gn.append(n(ci, 3, 3, "GroupControl", (800, 255, 1980, 1290) if geo else (0, 0, 0, 0), aid=cid))
         for d, x0, y, x1, t in specs:
             rect = (x0, y, x1, y + 22) if geo else (0, 0, 0, 0)
             gn.append(n(len(gn), ci, d, "TextControl", rect, text=t))
+        for x0, y0, x1, y1, nm in media:
+            rect = (x0, y0, x1, y1) if geo else (0, 0, 0, 0)
+            gn.append(n(len(gn), ci, 4, "ImageControl", rect, text=nm))
 
     # 对方：时间戳 + 昵称(d14) + 两个徽标(d15) + 正文(d16，下一行)
     add_container("7000000000000000001", [(13, 817, 240, 880, "12:34"),
@@ -695,6 +777,20 @@ if __name__ == "__main__":
                                          (15, 857, 600, 872, "LV"),
                                          (16, 830, 635, 988, "看不见")], geo=False)
 
+    # 非文字消息（图片/表情包/语音）→ 给占位，而不是直接消失
+    # 图片：名字行 + 大图（靠左 = 对方）
+    add_container("7000000000000000008", [(14, 817, 700, 848, "对方昵称"),
+                                         (15, 857, 700, 872, "LV")],
+                  media=[(830, 720, 1235, 1000, "")])
+    # 表情包：名字行 + 小而方的图（靠右 = 我）
+    add_container("7000000000000000009", [(14, 1573, 1010, 1925, "我的昵称"),
+                                         (15, 1611, 1011, 1626, "LV")],
+                  media=[(1737, 1030, 1925, 1218, "")])
+    # 语音：附件节点自己带“语音”这个名字 → 关键词优先
+    add_container("7000000000000000010", [(14, 817, 1250, 848, "对方昵称"),
+                                         (15, 857, 1250, 872, "LV")],
+                  media=[(830, 1270, 880, 1320, "语音")])
+
     pane_left, _ = pane_bounds(gn, PANEL)
     lst = find_message_list(gn, pane_left)
     assert lst is not None and lst.aid == "ml-root"
@@ -704,7 +800,14 @@ if __name__ == "__main__":
         ("her", "昵称六个字", "接着说的一句"),      # 继承发言人
         ("me", None, "我自己发的"),                  # 带昵称行也归我（靠右）
         ("me", None, "又一条"),                      # 连着发 → 仍然是我
+        ("her", "对方昵称", "[图片]"),                # 非文字 → 占位（方向按图算）
+        ("me", None, "[表情包]"),                     # 小而方的图 → 表情包
+        ("her", "对方昵称", "[语音]"),                # 附件自带“语音”名字
     ], turns
+    # 媒体锚点：只有图片/表情包/语音这三条带 media，其余是 None（给多模态预留）
+    anchors: list = []
+    build_turns(gn, pane_left=pane_left, list_node=lst, anchors=anchors)
+    assert [a is not None for a in anchors] == [False, False, False, False, True, True, True], anchors
 
     # ── 会话名：优先用消息列表外层 WindowControl 的 Name（实测它就是会话标题）────
     name_gn = [n(0, -1, 0, "PaneControl", PANEL),

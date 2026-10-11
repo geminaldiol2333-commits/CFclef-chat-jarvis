@@ -87,19 +87,23 @@ def _error_body(exc: urllib.error.HTTPError) -> str:
 
 def ask(state: dict, questions: dict, timeout: float = 20,
         provider: str = "openrouter", model: str | None = None,
-        base_url: str | None = None) -> dict:
+        base_url: str | None = None, files: list | None = None) -> dict:
     """问 Jev 一轮判断，返回 {"answers": {名字: 答案}, "usage": {...}}。
 
     provider ∈ JEV_PROVIDERS（clef 本地 / openrouter / typesafe 直连）；model=None 用该来源的默认模型。
     base_url 只有本地 clef 用得上（app/local_server.py 按端口算出来的 llama-server 地址）。
-    各路返回的 dict 形状一模一样，429/529 都会退避重试。绝不打印或写出 key。
+    files 是给多模态判断模型看的图，每项 (mime, bytes)：本地 clef 会把它转成
+    `/v1/systemone` 的 `files`（base64 data URL）。远程两条路不支持看图，传了就直接报错，
+    不静默丢掉。各路返回的 dict 形状一模一样，429/529 都会退避重试。绝不打印或写出 key。
     """
     spec = JEV_PROVIDERS.get(provider) or JEV_PROVIDERS["openrouter"]
     model = model or spec.default
     if spec.local:
         if not base_url:
             raise JevError("本地 clef-flash 地址为空：llama-server 还没启动（去设置里启动本地模型）")
-        return _ask_local(state, questions, base_url, model, timeout)
+        return _ask_local(state, questions, base_url, model, timeout, files=files)
+    if files:
+        raise JevError(f"{spec.name} 不支持看图：只有本地 clef 能收 files")
     key = _api_key(JEV_ENV)  # 两家远程共用同一把 key，换来源不用重填
     if provider == "typesafe":
         return _ask_typesafe(state, questions, key, model, timeout)
@@ -107,15 +111,22 @@ def ask(state: dict, questions: dict, timeout: float = 20,
 
 
 def _ask_local(state: dict, questions: dict, base_url: str, model: str,
-               timeout: float) -> dict:
+               timeout: float, files: list | None = None) -> dict:
     """本地 clef-flash：llama-server 的 /v1/systemone，跟 OpenRouter decisions 同一套 body/响应。
 
-    请求体 {model, state, questions}，响应 {model, answers, usage}。全程 127.0.0.1，不出网、不要 key。
-    连接被拒（服务还在加载/没起来）就退避重试几次，再报一句人话。
+    请求体 {model, state, questions}（有图时再加 files），响应 {model, answers, usage}。
+    files 里每项是 (mime, bytes)，转成官方 schema 要的 data URL。
+    模型不支持图像或没加载 mmproj 时 llama-server 返回 501，这里转成人话。
+    全程 127.0.0.1，不出网、不要 key。连接被拒（服务还在加载）就退避重试几次。
     """
     url = base_url.rstrip("/") + "/v1/systemone"
-    payload = json.dumps({"model": model, "state": state, "questions": questions},
-                         ensure_ascii=False).encode("utf-8")
+    payload_obj: dict = {"model": model, "state": state, "questions": questions}
+    if files:
+        import base64
+
+        payload_obj["files"] = [f"data:{mime};base64,{base64.b64encode(data).decode()}"
+                               for mime, data in files]
+    payload = json.dumps(payload_obj, ensure_ascii=False).encode("utf-8")
     last = ""
     for attempt in range(MAX_RETRIES + 1):
         req = urllib.request.Request(
@@ -132,6 +143,10 @@ def _ask_local(state: dict, questions: dict, base_url: str, model: str,
                 raise JevError(
                     "本地 llama-server 不支持 clef（/v1/systemone 404）："
                     "把 llama.cpp 升级到含 PR #29831 的构建后重启本地模型") from None
+            if exc.code == 501 and files:
+                raise JevError(
+                    "模型不收图（501）：要么这份 GGUF 不支持图像，要么启动时没加载多模态"
+                    "投影器（mmproj）。填好 clef 的 mmproj，或改成不带图的模式重试") from None
             last = f"HTTP {exc.code}: {_error_body(exc)[:300]}"
             if exc.code in (429, 503) and attempt < MAX_RETRIES:
                 time.sleep(2**attempt)
@@ -435,6 +450,21 @@ if __name__ == "__main__":
             raise SystemExit("应当抛错")
         except JevError as e:
             assert "PR #29831" in str(e)
+
+    # files → /v1/systemone 的 data URL（Omni/多模态预留）
+    with patch.object(urllib.request, "urlopen", _fake_local):
+        ask({"chat": {}}, questions, provider="clef", base_url="http://127.0.0.1:8790",
+            files=[("image/jpeg", b"JPEGBYTES")])
+    assert seen["local_body"]["files"] == ["data:image/jpeg;base64,SlBFR0JZVEVT"],         seen["local_body"].get("files")
+    # 远程来源不支持看图：要明说，不静默丢
+    os.environ[JEV_ENV] = "k"
+    try:
+        ask({"chat": {}}, questions, provider="openrouter",
+            files=[("image/jpeg", b"JPEGBYTES")])
+        raise SystemExit("应当抛错")
+    except JevError as e:
+        assert "不支持看图" in str(e), e
+    os.environ[JEV_ENV] = "ts-key"          # 还原：下面那条断言按 ts-key 算
 
     assert redact_secrets("key=ts-key or-key") == "key=[REDACTED] [REDACTED]"
     print("jev_client ok")

@@ -28,7 +28,7 @@ def analyze(messages: list, relationship: str, model: str | None = None,
             base_url: str | None = None, reply_to: str | None = None, style: str = "",
             thinking: bool = False, jev_provider: str = "clef",
             jev_model: str | None = None, jev_base_url: str | None = None,
-            group_judge_only: bool = False) -> dict:
+            group_judge_only: bool = False, files: list | None = None) -> dict:
     """messages: [(from, text)] from ∈ {her, me}，最新一条在最后；
     群聊里可以带第三项 name（说这句话的人），单聊不带。
     context: 起草和判断各看最近多少条消息（用户设置里的「参考上下文」）。
@@ -41,6 +41,8 @@ def analyze(messages: list, relationship: str, model: str | None = None,
     group_judge_only: 群聊只做判断，不起草也不排序（默认关，由调用方按设置传）。
         群聊里可能十几个人同时在聊几件不相关的事，一条「下一句」没有意义；
         这种时候连起草模型都不用加载。开启后返回的 candidates 是空的、mode="judge_only"。
+    files: 给判断模型看的图，每项 (mime, bytes)。**只传给判断那一步**（排序不需要看图，
+        免得白花 token），只有本地多模态 clef（配了 mmproj）支持。
     model / jev_model = None 用该来源的默认模型。
 
     返回 {candidates, best_index, best_reply, scores, answers, usage, reply_to}。
@@ -59,7 +61,8 @@ def analyze(messages: list, relationship: str, model: str | None = None,
     # 而且这样连起草模型都不必修/加载。
     if group_judge_only and (state.get("chat") or {}).get("is_group"):
         first = ask(state, dict(JUDGE_QUESTIONS), timeout=timeout,
-                    provider=jev_provider, model=jev_model, base_url=jev_base_url)
+                    provider=jev_provider, model=jev_model, base_url=jev_base_url,
+                    files=files)
         answers = first.get("answers") or {}
         _add_usage(usage, first.get("usage"))
         return {
@@ -70,7 +73,8 @@ def analyze(messages: list, relationship: str, model: str | None = None,
 
     try:
         first = ask(state, dict(JUDGE_QUESTIONS), timeout=timeout,
-                    provider=jev_provider, model=jev_model, base_url=jev_base_url)
+                    provider=jev_provider, model=jev_model, base_url=jev_base_url,
+                    files=files)
         answers = first.get("answers") or {}
         _add_usage(usage, first.get("usage"))
         judged = True

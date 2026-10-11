@@ -58,12 +58,15 @@ class UiaQqntCollector(BaseCollector):
 
     def __init__(self, hwnd, emit, debug_on=None, app=None, *,
                  selectors=None, focus_policy="steal",
-                 read_interval=READ_INTERVAL, user_grace=USER_ACTIVE_GRACE):
+                 read_interval=READ_INTERVAL, user_grace=USER_ACTIVE_GRACE,
+                 capture_media=False, media_max_side=1024):
         super().__init__(hwnd, emit, debug_on)
         self.sel = selectors or sel_from(None)
         self.focus_policy = focus_policy or "steal"
         self.read_interval = float(read_interval)
         self.user_grace = float(user_grace)
+        self.capture_media = bool(capture_media)   # 要不要把图片/表情包的像素截下来（给多模态判断）
+        self.media_max_side = int(media_max_side)
         self.seen: list[tuple[str, str, str | None]] = []
         self.title = ""
         self.last_area = None
@@ -275,10 +278,18 @@ class UiaQqntCollector(BaseCollector):
         if mode != self.last_mode:
             self.last_mode = mode
 
-        panel = next((n for n in nodes if n.depth == 0 and n.has_geo), None)
-        panel_rect = panel.rect if panel else (0, 0, 0, 0)
-        pane_left, _ = pane_bounds(nodes, panel_rect)
-        panel_right = panel_rect[2] or 0
+        # panel_rect 用「所有顶层容器的并集」，而不是单拿某一个：
+        # 拿第一个可能只是会话列表条（panel_right 会算成 833，头部文字被筛掉）；
+        # 拿最大的可能就是聊天区自己（pane_bounds 找不到更靠右的容器，退回比例切）。
+        # 并集才是整个内容区，pane_bounds 的“左边缘最靠右的整高容器 = 聊天区”才成立。
+        tops = [n.rect for n in nodes if n.depth == 0 and n.has_geo]
+        if tops:
+            panel_rect = (min(r[0] for r in tops), min(r[1] for r in tops),
+                          max(r[2] for r in tops), max(r[3] for r in tops))
+        else:
+            panel_rect = (0, 0, 0, 0)
+        pane_left, pane_right = pane_bounds(nodes, panel_rect)
+        panel_right = pane_right or panel_rect[2]
 
         # 消息列表根（实测 id=ml-root）；类名世界中就是气泡的公共祖先
         list_node = find_message_list(nodes, pane_left)
@@ -348,16 +359,55 @@ class UiaQqntCollector(BaseCollector):
             #   · 没打开会话 / 会话还在加载
             self._note_once("no-list", self._empty_reason(nodes))
             return
-        turns = build_turns(nodes, self.sel, pane_left=pane_left, list_node=list_node)
+        anchors: list = []
+        turns = build_turns(nodes, self.sel, pane_left=pane_left, list_node=list_node,
+                            anchors=anchors)
         if not turns:
             self._note_once("no-bubbles",
-                            "没读到气泡（message-container / msg-content-container）——"
-                            "可能这个 QQ 版本类名不同，可用 probe\\probe_qq_uia.py 抓一份树来对。")
+                            "没读到消息（message-container / ml-root 都没有）——"
+                            "可能这个 QQ 版本结构变了，用 probe\\probe_qq_uia.py 抓一份树来对。")
             return
-        fresh = new_turns(self.seen, turns, similar)
+        idx: list = []
+        fresh = new_turns(self.seen, turns, similar, idx)
         if fresh and self.title:
-            emit("lines", self.title, [(t.who, t.name, t.text) for t in fresh],
-                 self.last_area or (0, 0, 0, 0))
+            payload = []
+            for j, t in enumerate(fresh):
+                media = None
+                a = anchors[idx[j]] if idx[j] < len(anchors) else None
+                if self.capture_media and a is not None:
+                    media = self._grab(a)
+                payload.append((t.who, t.name, t.text, media) if media
+                               else (t.who, t.name, t.text))
+            emit("lines", self.title, payload, self.last_area or (0, 0, 0, 0))
+
+    def _grab(self, node) -> tuple[str, bytes] | None:
+        """把媒体节点的屏幕矩形截下来 → (mime, JPEG 字节)。**只在内存里**，不落盘。
+
+        长边超过 media_max_side 就缩小：给模型看图不需要原分辨率，
+        而且图片 token 数跟像素直接相关（clef 整个 prompt 要塞进一个 batch）。
+        """
+        if not node.has_geo:
+            return None
+        try:
+            import io
+
+            from PIL import ImageGrab
+        except Exception:
+            return None
+        left, top, right, bottom = node.rect
+        w, h = right - left, bottom - top
+        if w < 8 or h < 8:
+            return None
+        try:
+            img = ImageGrab.grab(bbox=(left, top, right, bottom), all_screens=True)
+        except Exception:
+            return None
+        scale = min(1.0, self.media_max_side / max(w, h))
+        if scale < 1.0:
+            img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))))
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, "JPEG", quality=85)
+        return ("image/jpeg", buf.getvalue())
 
 
 if __name__ == "__main__":
@@ -533,4 +583,44 @@ if __name__ == "__main__":
     c6._user_idle_seconds = lambda: 3.0            # 人离开了一会儿
     c6.poll(lambda *a: None)
     assert stolen, "空闲时应该按 A 策略短暂置前"
+    # 非文字消息：给占位；开了多模态就把图截下来一起发（Omni 预留）
+    img_root = Ctrl("PaneControl", (450, 210, 2110, 1170), kids=[
+        Ctrl("GroupControl", (520, 260, 833, 1165)),
+        Ctrl("GroupControl", (832, 260, 2105, 1165), kids=[
+            Ctrl("TextControl", (1031, 237, 1084, 263), cls="", name="群名"),
+            Ctrl("GroupControl", (832, 325, 1880, 907), aid="ml-root", kids=[
+                Ctrl("GroupControl", (800, 330, 1880, 620), aid="7000000000000000001", kids=[
+                    Ctrl("TextControl", (817, 340, 848, 362), cls="", name="对方"),
+                    # 徽标比昵称深一层（真机就是这样），所以包一层
+                    Ctrl("GroupControl", (857, 340, 872, 362), kids=[
+                        Ctrl("TextControl", (857, 340, 872, 362), cls="", name="LV"),
+                    ]),
+                    Ctrl("ImageControl", (830, 380, 1235, 620), cls="", name=""),
+                ]),
+            ]),
+            Ctrl("GroupControl", (852, 916, 1218, 957), aid="func-bar-shortcuts-left"),
+        ]),
+    ])
+    state["root"] = img_root
+    ev3: list = []
+    em3 = lambda kind, *p: ev3.append((kind,) + tuple(p))
+    c9 = UiaQqntCollector(1234, em3, selectors=Selectors(), read_interval=0,
+                          capture_media=False)
+    c9._is_foreground = lambda: True
+    c9._window_origin = lambda: (0, 0)
+    c9.start(); ev3.clear(); c9.poll(em3)
+    lines = [e for e in ev3 if e[0] == "lines"][0][2]
+    assert lines == [("her", "对方", "[图片]")], lines        # 占位；没开多模态就只有 3 元组
+    # 开了多模态：媒体会被截下来放进第 4 项
+    c10 = UiaQqntCollector(1234, em3, selectors=Selectors(), read_interval=0,
+                           capture_media=True)
+    c10._is_foreground = lambda: True
+    c10._window_origin = lambda: (0, 0)
+    grabbed = []
+    c10._grab = lambda node: (grabbed.append(node) or ("image/jpeg", b"X"))
+    c10.start(); ev3.clear(); c10.poll(em3)
+    lines = [e for e in ev3 if e[0] == "lines"][0][2]
+    assert lines == [("her", "对方", "[图片]", ("image/jpeg", b"X"))], lines
+    assert grabbed and grabbed[0].type == "ImageControl", grabbed
+
     print("uia_qqnt ok")

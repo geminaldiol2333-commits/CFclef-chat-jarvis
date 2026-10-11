@@ -34,9 +34,11 @@ def build(app, hwnd, emit, debug_on=None) -> BaseCollector:
             selectors = sel_from(settings.qq_selectors())
             interval = settings.qq_poll_seconds()
             grace = settings.qq_user_grace_seconds()
+            capture = settings.perceive_media()
         except Exception:
-            policy, selectors, interval, grace = "steal", sel_from(None), 1.2, 1.5
+            policy, selectors, interval, grace, capture = "steal", sel_from(None), 1.2, 1.5, False
         return UiaQqntCollector(hwnd, emit, debug_on, app=app,
                                 selectors=selectors, focus_policy=policy,
-                                read_interval=interval, user_grace=grace)
+                                read_interval=interval, user_grace=grace,
+                                capture_media=capture)
     raise RuntimeError(f"未知采集引擎：{engine!r}（app/chatapps.py 里的 collector 字段）")

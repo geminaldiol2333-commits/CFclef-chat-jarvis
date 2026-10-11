@@ -123,6 +123,22 @@ def local_draft_model() -> str:
     """起草文本模型的 .gguf 路径（不能是 clef，它写不了字）。"""
     return str(_read("local_draft_model") or "")
 
+
+def local_clef_mmproj() -> str:
+    """clef 的多模态投影器（mmproj）路径。填了才会给判断模型喂图。
+
+    llama.cpp 需要 `--mmproj` 加载投影器，`/v1/systemone` 才会接受 `files`。"""
+    return str(_read("local_clef_mmproj") or "")
+
+
+def perceive_media() -> bool:
+    """要不要把非文字消息（图片/表情包）的像素喂给判断模型。
+
+    默认：配了 mmproj 就开（多模态判断）；没配就只发占位文字，不发图。
+    显式写 false/true 就按写的来。"""
+    v = _read("perceive_media")
+    return bool(local_clef_mmproj()) if v is None else bool(v)
+
 def local_clef_port() -> int:
     return _int("local_clef_port", _DEFAULT_CLEF_PORT, 1024, 65535)
 
@@ -267,7 +283,8 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
          local_models_dir_text: str | None = None, local_clef_model_text: str | None = None,
          local_draft_model_text: str | None = None, local_autostart_on: bool | None = None,
          local_idle_unload_on: bool | None = None, local_idle_seconds_n: int | None = None,
-         qq_focus_policy_text: str | None = None, group_judge_only_on: bool | None = None) -> None:
+         qq_focus_policy_text: str | None = None, group_judge_only_on: bool | None = None,
+         local_clef_mmproj_text: str | None = None) -> None:
     """每个参数为空/None = 保留当前值。两把 key 写进程环境 + HKCU\\Environment，不写任何文件。"""
     jev = jev_provider_text if jev_provider_text in JEV_PROVIDERS else jev_provider()
     draft = draft_provider_text if draft_provider_text in DRAFT_PROVIDERS else draft_provider()
@@ -309,6 +326,7 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
                             else (qq_focus_policy_text if qq_focus_policy_text in ("steal", "foreground")
                                   else qq_focus_policy())),
         "group_judge_only": flag(group_judge_only_on, group_judge_only),
+        "local_clef_mmproj": keep(local_clef_mmproj_text, "local_clef_mmproj"),
     }
     with open(_CONFIG, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)

@@ -42,6 +42,7 @@ class Models:
     models_dir: str = ""
     clef_model: str = ""
     draft_model: str = ""
+    clef_mmproj: str = ""          # 多模态投影器；填了 clef 就能看图（/v1/systemone 的 files）
     clef_port: int = 8790
     draft_port: int = 8791
     gpu_layers: int = 999
@@ -61,6 +62,7 @@ def config_from_settings() -> Models:
         models_dir=settings.local_models_dir(),
         clef_model=settings.local_clef_model(),
         draft_model=settings.local_draft_model(),
+        clef_mmproj=settings.local_clef_mmproj(),
         clef_port=settings.local_clef_port(),
         draft_port=settings.local_draft_port(),
         gpu_layers=settings.local_gpu_layers(),
@@ -301,6 +303,10 @@ class LocalServerManager:
             args += ["--verbosity", "1"]
         if kind == "draft" and "--jinja" in f:  # 用模型自带的 chat template
             args += ["--jinja"]
+        if kind == "clef" and self.models.clef_mmproj:   # 多模态投影器：判断模型才能看图
+            mm = resolve_gguf(self.models.clef_mmproj, self.models.models_dir, "mmproj")
+            if mm and os.path.isfile(mm) and any(x in f for x in ("-mm", "--mmproj")):
+                args += ["--mmproj", mm]
         return args
 
     def _drain(self, kind: str, proc: subprocess.Popen) -> None:
