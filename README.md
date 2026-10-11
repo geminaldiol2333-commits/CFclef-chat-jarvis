@@ -258,6 +258,11 @@ hf download ggml-org/Clef-Flash-GGUF Clef-Flash-Q8_0.gguf --local-dir D:\AI_Tool
 OCR 用 RapidOCR 的中英文模型；上游为韩文 KakaoTalk 加的 Windows.Media.Ocr 后端已经随 KakaoTalk
 适配一起移除了（历史版本见 git 记录）。
 
+**QQ NT（Windows）目前还不支持。** 调研、实测数据和阻塞点都记在 [docs/QQNT.md](docs/QQNT.md)：
+窗口很好认（`Chrome_WidgetWin_1` / 标题 `QQ`），但现有 `chat_area()` 的像素锚点在 QQ NT 上失效
+（聊天区是壁纸/渐变，不是平底色），还需要一个 QQ 专用的面板/输入框定位器。
+`probe/probe_qq_windows.py` 和 `probe/probe_qq_pane.py` 是配套的测量探针。
+
 ## 故障排查
 
 | 现象 | 原因 / 处理 |
@@ -276,6 +281,7 @@ OCR 用 RapidOCR 的中英文模型；上游为韩文 KakaoTalk 加的 Windows.M
 ## 已知限制
 
 - 判断与起草两个模型同时驻留显存，显存占用按两者之和算；没有做「用完一个换另一个」的串行加载。
+- 只适配微信；QQ NT 见 [docs/QQNT.md](docs/QQNT.md)（已调研，未实现）。
 
 ## 授权
 
