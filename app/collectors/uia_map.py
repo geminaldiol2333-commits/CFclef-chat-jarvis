@@ -203,6 +203,66 @@ def _ancestor_of_kind(nodes: Sequence[Node], node: Node, kinds: tuple[str, ...])
     return None
 
 
+REGION_LABELS = ("消息列表", "会话列表", "群成员列表", "联系人", "窗口控制区域", "搜索",
+                 "消息", "聊天")
+
+# 右栏成员面板里的角色标签，不是人名
+ROLE_WORDS = ("群主", "管理员", "群聊成员")
+
+
+def _is_region_label(text: str) -> bool:
+    """是不是 QQ 自己的区域标签（不是会话名）。
+
+    实测：主面板里 ml-root 外面那层 WindowControl 的 Name 就是「消息列表」，
+    同层还有「会话列表」（左栏）、「群成员列表」（右栏）、「窗口控制区域」。
+    这些都不是会话名；拿它们当 key 就会把不同会话撞成一个（切会话就不会重置了）。"""
+    return text.strip() in REGION_LABELS
+
+
+def group_fingerprint(nodes: Sequence[Node], list_node: Node | None,
+                      panel_right: int = 0) -> str:
+    """群名读不到时，给这个群一个**稳定的**键：成员数 + 前几个成员名。
+
+    为什么需要（全部实测）：某个 521 人群在主面板视图里根本不给群名——
+      · ml-root 外面那层 WindowControl 的 Name 是区域标签「消息列表」；
+      · 头部行只有成员数 `(521)`（会被尾数正则滤掉）；
+      · 会话列表不实现 UIA 选中模式（容器无 SelectionPattern，21 个子节点全无
+        SelectionItemPattern），不能反查「当前选中的是哪个会话」；
+      · 树里只有按**消息**变的雪花 id，没有按会话变的 id。
+    但同一个群里「成员数 + 前几个成员名」是稳定的，又足以把不同的群分开。
+    连群特征都读不到（没右栏也没成员数）就返回空串——调用方宁可不换 key，
+    也不要拿一个会变的字符串当会话名。
+    """
+    if list_node is None or not list_node.has_geo:
+        return ""
+    count = ""
+    for n in nodes:
+        if n.type != "TextControl" or not n.has_text:
+            continue
+        m = re.search(r"群聊成员\s*(\d+)", n.text)
+        if m:
+            count = m.group(1)
+            break
+        if (not count and n.rect[1] < list_node.rect[1]
+                and COUNT_ONLY.match(n.text.strip())):
+            count = re.sub(r"\D", "", n.text)          # 头部那个 (521)
+    names: list[str] = []
+    left = list_node.rect[2]
+    for n in nodes:
+        if (n.type != "TextControl" or not n.has_text or not n.has_geo
+                or n.rect[0] < left - PANE_TOL or "群聊成员" in n.text
+                or n.text.strip() in ROLE_WORDS or COUNT_ONLY.match(n.text.strip())):
+            continue
+        # 成员面板里的名字是最左那一列；右边的“群主/管理员”那些已经按词滤掉了
+        if n.rect[0] - left < 0.4 * max(1, (panel_right or n.rect[2]) - left) \
+                and n.text.strip() not in names:
+            names.append(n.text.strip())
+    if not count and not names:
+        return ""
+    head = f"群 {count} 人" if count else "群聊"
+    return head + (" · " + "、".join(names[:2]) if names else "")
+
+
 def find_session_row(nodes: Sequence[Node], pane_left: int, sel: Selectors = SEL_DEFAULT,
                      list_node: Node | None = None, panel_right: int = 0) -> list[Node]:
     """会话名所在的那一行。三个来源，从可靠到不可靠：
@@ -219,7 +279,8 @@ def find_session_row(nodes: Sequence[Node], pane_left: int, sel: Selectors = SEL
     if list_node is None or not list_node.has_geo:
         return []
     wrap = _ancestor_of_kind(nodes, list_node, ("WindowControl",))
-    if wrap is not None and wrap.has_text and not COUNT_ONLY.match(wrap.text.strip()):
+    if (wrap is not None and wrap.has_text and not COUNT_ONLY.match(wrap.text.strip())
+            and not _is_region_label(wrap.text)):
         return [wrap]
     above = [n for n in nodes if n.type == "TextControl" and n.has_text
              and n.has_geo and n.rect[1] < list_node.rect[1]
@@ -252,10 +313,9 @@ def find_session(nodes: Sequence[Node], pane_left: int, sel: Selectors = SEL_DEF
     ponytail: 头部显示内容变了（如成员数增加）会当成新会话；所以去掉尾部的 `(1234)`。
     """
     row = find_session_row(nodes, pane_left, sel, list_node=list_node, panel_right=panel_right)
-    if not row:
-        return ""
-    text = "".join(n.text.strip() for n in row).strip()
-    return re.sub(r"[（(]\d+[)）]\s*$", "", text).strip()
+    text = "".join(n.text.strip() for n in row).strip() if row else ""
+    text = re.sub(r"[（(]\d+[)）]\s*$", "", text).strip()
+    return text or group_fingerprint(nodes, list_node, panel_right)
 
 
 def find_editor(nodes: Sequence[Node], pane_left: int, sel: Selectors = SEL_DEFAULT,
@@ -832,6 +892,52 @@ if __name__ == "__main__":
     l3 = find_message_list(no_wrap, pnl2)
     got = find_session(no_wrap, pnl2, list_node=l3, panel_right=PANEL[2])
     assert got == "另一个群名", got
+
+    # ── 区域标签不是会话名（实测：ml-root 外面那层 WindowControl 的 Name 就是「消息列表」）──
+    # 这种树以前会拿「消息列表」当 key：不同会话撞成一个，切会话就不重置了。
+    region = [n(0, -1, 0, "PaneControl", PANEL),
+              n(1, 0, 1, "GroupControl", (520, 260, 833, 1165)),
+              n(2, 0, 1, "WindowControl", (430, 281, 743, 1234), text="会话列表"),
+              n(3, 0, 1, "GroupControl", (742, 217, 2225, 1232)),
+              n(4, 3, 2, "WindowControl", (742, 281, 2000, 976), text="消息列表"),
+              n(5, 4, 3, "GroupControl", LIST, aid="ml-root"),
+              n(6, 3, 2, "WindowControl", (2025, 166, 2230, 216), text="窗口控制区域"),
+              n(7, 3, 2, "WindowControl", (2002, 569, 2223, 1239), text="群成员列表"),
+              n(8, 3, 2, "TextControl", (971, 237, 1024, 263), text="(521)")]
+    pnl3, _ = pane_bounds(region, PANEL)
+    l4 = find_message_list(region, pnl3)
+    got = find_session(region, pnl3, list_node=l4, panel_right=2223)
+    assert got == "群 521 人", got          # 头部只剩成员数：退回群指纹（有右栏时还会带成员名）
+    assert got != "消息列表" and got != "会话列表"
+    assert _is_region_label("消息列表") and not _is_region_label("高速网盘")
+    assert find_session_row(region, pnl3, list_node=l4, panel_right=2223)[0].text.strip() == "(521)", \
+        "区域标签应该被跳过，落到头部行"
+
+    # 群指纹：成员数 + 前两个成员名（同一群里稳定，又能把不同的群分开）
+    fp = region + [n(9, 7, 3, "TextControl", (2015, 529, 2090, 555), text="群聊成员 521"),
+                   n(10, 7, 3, "TextControl", (2050, 579, 2140, 605), text="传输数据小助手"),
+                   n(11, 7, 3, "TextControl", (2180, 581, 2223, 607), text="群主"),
+                   n(12, 7, 3, "TextControl", (2050, 619, 2110, 645), text="菜菜子"),
+                   n(13, 7, 3, "TextControl", (2167, 621, 2223, 647), text="管理员")]
+    pnl4, _ = pane_bounds(fp, PANEL)
+    l5 = find_message_list(fp, pnl4)
+    assert group_fingerprint(fp, l5, 2223) == "群 521 人 · 传输数据小助手、菜菜子", \
+        group_fingerprint(fp, l5, 2223)
+    assert find_session(fp, pnl4, list_node=l5, panel_right=2223) == "群 521 人 · 传输数据小助手、菜菜子"
+    # 群里换了个成员数 → key 会变（少见）；但至少不会是空的、也不会跟别人撞
+    assert group_fingerprint(fp, None, 2223) == ""          # 没有消息列表就什么都读不出
+    assert group_fingerprint(no_wrap, l3, PANEL[2]) == "群 423 人", "只有成员数时也应给出指纹"
+    # 单聊那种连成员数都没有的：给空串，调用方宁可不换 key（见 uia_qqnt 的「读不到会话名就不读消息」）
+    bare_tree = [n(0, -1, 0, "PaneControl", PANEL),
+                 n(1, 0, 1, "GroupControl", LIST, aid="ml-root"),
+                 n(2, 0, 1, "WindowControl", (742, 281, 2000, 976), text="消息列表")]
+    pnl5, _ = pane_bounds(bare_tree, PANEL)
+    l6 = find_message_list(bare_tree, pnl5)
+    assert group_fingerprint(bare_tree, l6, PANEL[2]) == "", "读不出群特征就别硬造"
+    assert find_session(bare_tree, pnl5, list_node=l6, panel_right=PANEL[2]) == ""
+
+    # 有名字的 WindowControl 依旧优先（这条不能被指纹抢走）
+    assert find_session(name_gn, pnl, list_node=l2, panel_right=PANEL[2]) == "高速网盘"
 
     # 空树 / 后台状态
     assert build_turns([], pane_left=0) == []
