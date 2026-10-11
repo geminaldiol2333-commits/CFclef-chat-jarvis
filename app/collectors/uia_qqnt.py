@@ -38,7 +38,7 @@ TINY_TREE = 40           # 少于这么多节点 = 多半是「后台窗口只�
 REVIVE_WAIT = 0.8        # 等 Chromium 把无障碍树建出来（社区实测 800ms）
 READ_INTERVAL = 1.2      # 两次读树的最小间隔（秒）：读一次要几百 ms，不能每 50ms 跑一遍
 USER_ACTIVE_GRACE = 1.5  # 人在打字/动鼠标的这段时间内不去抢焦点（秒）
-WHEEL_TICKS = 3          # 回填历史时每次滚多少格
+WHEEL_TICKS = 6          # 回填历史时每次滚多少格（滚动本身很便宜，扫描很贵：一格 3 条太少）
 SCROLL_SETTLE = 0.35     # 滚动后等多久让列表渲染完（虚拟列表要现渲）
 
 
@@ -89,6 +89,8 @@ class UiaQqntCollector(BaseCollector):
         self._auto = None
         self._noted: set[str] = set()
         self._prev_foreground = None
+        self._ml = None                            # 缓存的消息列表控件（回填时只走它这棵子树）
+        self._pane = None                          # 上一拍算好的 (pane_left, pane_right, panel, list)
         self._last_read = 0.0
 
     @staticmethod
@@ -125,14 +127,25 @@ class UiaQqntCollector(BaseCollector):
 
     # ---------------------------------------------------------------- 读图 + 回填历史
 
-    def _scan(self):
-        """读一棵树并定位：返回 (nodes, pane_left, pane_right, list_node)。"""
+    def _scan(self, only_messages: bool = False):
+        """读一棵树并定位：返回 (nodes, pane_left, pane_right, list_node)。
+
+        only_messages=True：只走消息列表子树，并沿用上一拍算好的 pane 边界
+        （实测整树 2.4s / 836 节点，只走消息列表 0.8s / 252 节点——
+        回填要一连滚十几步，走整树就是干等几十秒）。"""
+        if only_messages:
+            nodes = self._read_tree(only_messages=True)
+            if len(nodes) > 1 and self._pane and self._pane[3] is not None:
+                pane_left, pane_right = self._pane[0], self._pane[1]
+                return nodes, pane_left, pane_right, nodes[0]      # nodes[0] 就是 ml-root
         nodes = self._read_tree()
         tops = [n.rect for n in nodes if n.depth == 0 and n.has_geo]
         panel = ((min(r[0] for r in tops), min(r[1] for r in tops),
                   max(r[2] for r in tops), max(r[3] for r in tops)) if tops else (0, 0, 0, 0))
         pane_left, pane_right = pane_bounds(nodes, panel)
-        return nodes, pane_left, pane_right, find_message_list(nodes, pane_left)
+        list_node = find_message_list(nodes, pane_left)
+        self._pane = (pane_left, pane_right, panel, list_node)
+        return nodes, pane_left, pane_right, list_node
 
     def _emit_turns(self, nodes, emit, pane_left, list_node) -> int:
         """从一棵树里取新消息发 lines，返回这次发了几条（去重靠 self.seen）。
@@ -158,8 +171,8 @@ class UiaQqntCollector(BaseCollector):
         emit("lines", self.title, payload, self.last_area or (0, 0, 0, 0))
         return len(fresh)
 
-    def _read_and_emit(self, emit) -> int:
-        nodes, pane_left, _, list_node = self._scan()
+    def _read_and_emit(self, emit, only_messages: bool = False) -> int:
+        nodes, pane_left, _, list_node = self._scan(only_messages=only_messages)
         return self._emit_turns(nodes, emit, pane_left, list_node)
 
     def _backfill(self, emit) -> int:
@@ -183,34 +196,41 @@ class UiaQqntCollector(BaseCollector):
         sent = 0
         cx = (list_node.rect[0] + list_node.rect[2]) // 2
         cy = (list_node.rect[1] + list_node.rect[3]) // 2
-        try:
-            u32.SetCursorPos(cx, cy)          # 滚轮发给光标下的窗口
+        try:                                          # 滚轮发给光标下的窗口
+            old = w.POINT()
+            has_old = bool(u32.GetCursorPos(ctypes.byref(old)))
+            u32.SetCursorPos(cx, cy)
         except Exception:
-            return sent
+            return self._read_and_emit(emit)          # 动不了滚动也要把当前视图读了
         ups = 0
         known: set[tuple[str, str]] = set()
-        for _ in range(max(1, self.max_scrolls)):
-            auto.WheelUp(wheelTimes=WHEEL_TICKS)
-            time.sleep(SCROLL_SETTLE)
-            ups += 1
-            nodes, pane_left, _, list_node = self._scan()
-            if list_node is None:
-                break
-            turns = build_turns(nodes, self.sel, pane_left=pane_left, list_node=list_node)
-            now = {(t.who, t.text) for t in turns}
-            # 到顶的判据是「这一滚没有带来任何新消息」，不是「可见条数不再变大」——
-            # 可见条数本来就恒等于一屏（虚拟列表就渲这么多）。
-            if not (now - known):
-                break
-            known |= now
-            if len(known) >= self.backfill:
-                break                         # 已经够多了
-        # 往下走回到最新处，边走边发（于是顺序是从旧到新）
-        for _ in range(ups):
-            auto.WheelDown(wheelTimes=WHEEL_TICKS)
-            time.sleep(SCROLL_SETTLE)
-            sent += self._read_and_emit(emit)
-        sent += self._read_and_emit(emit)     # 最后再读一次，确保最新那条也在
+        try:
+            for _ in range(max(1, self.max_scrolls)):
+                auto.WheelUp(wheelTimes=WHEEL_TICKS)
+                time.sleep(SCROLL_SETTLE)
+                ups += 1
+                # 滚轮步骤只走消息列表子树（整树 2.4s/遍，子树 0.8s/遍）
+                nodes, pane_left, _, list_node = self._scan(only_messages=True)
+                if list_node is None:
+                    break
+                turns = build_turns(nodes, self.sel, pane_left=pane_left, list_node=list_node)
+                now = {(t.who, t.text) for t in turns}
+                # 到顶的判据是「这一滚没有带来任何新消息」，不是「可见条数不再变大」——
+                # 可见条数本来就恒等于一屏（虚拟列表就渲这么多）。
+                if not (now - known):
+                    break
+                known |= now
+                if len(known) >= self.backfill:
+                    break                         # 已经够多了
+            # 往下走回到最新处，边走边发（于是顺序是从旧到新）
+            for _ in range(ups):
+                auto.WheelDown(wheelTimes=WHEEL_TICKS)
+                time.sleep(SCROLL_SETTLE)
+                sent += self._read_and_emit(emit, only_messages=True)
+        finally:
+            if has_old:                           # 别把用户的鼠标丢在聊天记录中间
+                u32.SetCursorPos(old.x, old.y)
+        sent += self._read_and_emit(emit)     # 最后再读一次（整树），确保最新那条也在
         return sent
 
     # ---------------------------------------------------------------- 读树
@@ -265,36 +285,54 @@ class UiaQqntCollector(BaseCollector):
         except Exception:
             pass
 
-    def _read_tree(self) -> list[Node]:
+    def _read_tree(self, only_messages: bool = False) -> list[Node]:
+        """整棵无障碍树 → Node 列表（先序，index 就是 DOM 顺序）。
+
+        only_messages=True 时只走上次找到的 ml-root 子树（快 3 倍）。QQ 重建列表时
+        缓存的控件会失效，那就自动退回整树走一遍。"""
         auto = self._auto
-        root = auto.ControlFromHandle(self.hwnd)
+        if only_messages and self._ml is not None:
+            top = self._node_of(self._ml, 0, -1, 0)
+            if top is not None:
+                nodes = [top]
+                self._walk(self._ml, nodes, 0, 1)
+                if len(nodes) > 1:
+                    return nodes
+            self._ml = None              # 缓存过期（列表被重建），退回整树
         nodes: list[Node] = []
-
-        def walk(ctrl, depth: int, parent: int) -> None:
-            if depth > TREE_DEPTH or len(nodes) >= TREE_BUDGET:
-                return
-            try:
-                children = ctrl.GetChildren()
-            except Exception:
-                return
-            for c in children:
-                if len(nodes) >= TREE_BUDGET:
-                    return
-                idx = len(nodes)
-                try:
-                    r = c.BoundingRectangle
-                    nodes.append(Node(index=idx, parent=parent, depth=depth,
-                                      type=c.ControlTypeName or "",
-                                      cls=c.ClassName or "",
-                                      aid=getattr(c, "AutomationId", "") or "",
-                                      rect=(r.left, r.top, r.right, r.bottom),
-                                      text=c.Name or "", text_len=len(c.Name or "")))
-                except Exception:
-                    continue
-                walk(c, depth + 1, idx)
-
-        walk(root, 0, -1)
+        self._ml = None
+        self._walk(auto.ControlFromHandle(self.hwnd), nodes, -1, 0)
         return nodes
+
+    def _node_of(self, ctrl, index: int, parent: int, depth: int) -> Node | None:
+        try:
+            r = ctrl.BoundingRectangle
+            name = ctrl.Name or ""
+            return Node(index=index, parent=parent, depth=depth,
+                        type=ctrl.ControlTypeName or "", cls=ctrl.ClassName or "",
+                        aid=getattr(ctrl, "AutomationId", "") or "",
+                        rect=(r.left, r.top, r.right, r.bottom), text=name, text_len=len(name))
+        except Exception:
+            return None
+
+    def _walk(self, ctrl, nodes: list[Node], parent: int, depth: int) -> None:
+        """把 ctrl 的子孙按先序塞进 nodes（ctrl 自己不算）；顺手记住 ml-root 的控件对象。"""
+        if depth > TREE_DEPTH or len(nodes) >= TREE_BUDGET:
+            return
+        try:
+            children = ctrl.GetChildren()
+        except Exception:
+            return
+        for c in children:
+            if len(nodes) >= TREE_BUDGET:
+                return
+            n = self._node_of(c, len(nodes), parent, depth)
+            if n is None:
+                continue
+            nodes.append(n)
+            if n.aid == "ml-root":
+                self._ml = c
+            self._walk(c, nodes, n.index, depth + 1)
 
     # ---------------------------------------------------------------- 每拍
 
@@ -723,15 +761,22 @@ if __name__ == "__main__":
     TOTAL, VIEW = 40, 5
     TXT = lambda i: f"msg{i}A内容{i}B"      # 造得彼此不像，免得被“相似即同一条”的去重吃掉
     vstate = {"lo": TOTAL - VIEW, "session": "群A"}
-    def fake_window_tree():
+    builds = [0]
+
+    def ml_ctrl():
+        """当前的「消息列表」控件（按 vstate 现造，相当于活树每拍都是当前视图）。"""
         lo = max(0, min(vstate["lo"], TOTAL - VIEW))
-        kids = [Ctrl("TextControl", (1031, 237, 1084, 263), cls="", name=vstate["session"]),
-                Ctrl("GroupControl", (832, 325, 1880, 907), aid="ml-root", kids=[
-                    Ctrl("GroupControl", (830, 340 + 40 * k, 1300, 380 + 40 * k),
-                         cls="message-container", name=TXT(lo + k)) for k in range(VIEW)])]
+        return Ctrl("GroupControl", (832, 325, 1880, 907), aid="ml-root", kids=[
+            Ctrl("GroupControl", (830, 340 + 40 * k, 1300, 380 + 40 * k),
+                 cls="message-container", name=TXT(lo + k)) for k in range(VIEW)])
+
+    def fake_window_tree():
+        builds[0] += 1
         return Ctrl("PaneControl", (450, 210, 2110, 1170), kids=[
             Ctrl("GroupControl", (520, 260, 833, 1165)),
-            Ctrl("GroupControl", (832, 260, 2105, 1165), kids=kids)])
+            Ctrl("GroupControl", (832, 260, 2105, 1165), kids=[
+                Ctrl("TextControl", (1031, 237, 1084, 263), cls="", name=vstate["session"]),
+                ml_ctrl()])])
     def as_nodes(root):
         """把 Ctrl 假树变成采集器真正会拿到的 Node 列表（_read_tree 的返回形状）。"""
         out: list = []
@@ -751,14 +796,35 @@ if __name__ == "__main__":
     c11._is_foreground = lambda: True
     c11._window_origin = lambda: (0, 0)
     c11._user_idle_seconds = lambda: 9.0          # 假装人离开了一会儿，允许滚动
-    c11._read_tree = lambda: as_nodes(fake_window_tree())
+    def fake_read(only_messages=False):
+        """只桩掉「从 hwnd 拿根控件」这一步；_node_of/_walk 都跑真的（子树快路径也就被覆盖了）。"""
+        if only_messages:
+            live = ml_ctrl()                       # 活树每拍都是当前视图；快路径不重建整树
+            top = c11._node_of(live, 0, -1, 0)
+            nodes = [top]
+            c11._walk(live, nodes, 0, 1)
+            if len(nodes) > 1:
+                return nodes
+        return as_nodes(fake_window_tree())
+    c11._read_tree = fake_read
+    # 真跑一遍整树 → 缓存 ml-root 控件和 pane 边界；之后滚轮步骤应该只走 ml-root 子树
+    nodes0, pl0, pr0, _lst0 = c11._scan()
+    c11._ml = ml_ctrl()          # 缓存住 ml-root 控件（真实现里由 _walk 顺手记住）
+    before = builds[0]
+    nodes_cheap, pl_c, _, lst_c = c11._scan(only_messages=True)
+    assert builds[0] == before, "only_messages 不该重建整棵树"
+    assert nodes_cheap[0].aid == "ml-root" and len(nodes_cheap) == 1 + VIEW, nodes_cheap
+    assert (pl_c, lst_c.rect) == (pl0, _lst0.rect)
     fake.WheelUp = lambda wheelTimes=3: vstate.update(lo=max(0, vstate["lo"] - wheelTimes))
     fake.WheelDown = lambda wheelTimes=3: vstate.update(lo=min(TOTAL - VIEW, vstate["lo"] + wheelTimes))
     c11.start(); ev4.clear()
+    builds[0] = 0
     c11.poll(em4)
     kinds = [e[0] for e in ev4]
     assert kinds[:2] == ["chat", "reset"], kinds        # 首次读就是“切到这个会话”
     assert vstate["lo"] == TOTAL - VIEW, vstate         # 回填完要回到最新处
+    # 滚轮那十几步必须只走 ml-root 子树：整树实测 2.4s/遍 → 17 遍就是干等 40 秒（真踩过）
+    assert builds[0] <= 4, f"回填每步都在重建整树（{builds[0]} 次）"
     allt = [x[2] for e in ev4 if e[0] == "lines" for x in e[2]]
     assert allt and allt[-1] == TXT(TOTAL - 1), allt[-3:]      # 最后一条是最新的
     assert allt == sorted(allt, key=lambda t: int(t.split("A")[0][3:])), allt[:6]  # 从旧到新

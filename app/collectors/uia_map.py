@@ -235,13 +235,13 @@ def group_fingerprint(nodes: Sequence[Node], list_node: Node | None,
     """
     if list_node is None or not list_node.has_geo:
         return ""
-    count = ""
+    count, member_top = "", None
     for n in nodes:
         if n.type != "TextControl" or not n.has_text:
             continue
         m = re.search(r"群聊成员\s*(\d+)", n.text)
         if m:
-            count = m.group(1)
+            count, member_top = m.group(1), n.rect[1]
             break
         if (not count and n.rect[1] < list_node.rect[1]
                 and COUNT_ONLY.match(n.text.strip())):
@@ -253,10 +253,17 @@ def group_fingerprint(nodes: Sequence[Node], list_node: Node | None,
                 or n.rect[0] < left - PANE_TOL or "群聊成员" in n.text
                 or n.text.strip() in ROLE_WORDS or COUNT_ONLY.match(n.text.strip())):
             continue
-        # 成员面板里的名字是最左那一列；右边的“群主/管理员”那些已经按词滤掉了
+        # 右栏最上面是「群公告 + 公告正文」，也是从 x≈2015 开始的短/长文本——
+        # 实测把「群公告」「兑换码：93TJY3…」当成了成员名。成员名单在「群聊成员 N」那一行
+        # **下面**，按这个分界；再加上“短、不带冒号”两条，公告行就进不来了。
+        if member_top is not None and n.rect[1] < member_top:
+            continue
+        text = n.text.strip()
+        if len(text) > 16 or "：" in text or ":" in text:
+            continue
         if n.rect[0] - left < 0.4 * max(1, (panel_right or n.rect[2]) - left) \
-                and n.text.strip() not in names:
-            names.append(n.text.strip())
+                and text not in names:
+            names.append(text)
     if not count and not names:
         return ""
     head = f"群 {count} 人" if count else "群聊"
@@ -923,6 +930,14 @@ if __name__ == "__main__":
     l5 = find_message_list(fp, pnl4)
     assert group_fingerprint(fp, l5, 2223) == "群 521 人 · 传输数据小助手、菜菜子", \
         group_fingerprint(fp, l5, 2223)
+    # 右栏顶部是「群公告 + 公告正文」：实测被当成了成员名（真 bug），不能进指纹
+    ann = fp + [n(14, 7, 3, "TextControl", (2015, 304, 2065, 330), text="群公告"),
+                n(15, 7, 3, "TextControl", (2015, 348, 2223, 400),
+                  text="兑换码：93TJY3M6，先到先得")]
+    pnl6, _ = pane_bounds(ann, PANEL)
+    l7 = find_message_list(ann, pnl6)
+    assert group_fingerprint(ann, l7, 2223) == "群 521 人 · 传输数据小助手、菜菜子", \
+        group_fingerprint(ann, l7, 2223)
     assert find_session(fp, pnl4, list_node=l5, panel_right=2223) == "群 521 人 · 传输数据小助手、菜菜子"
     # 群里换了个成员数 → key 会变（少见）；但至少不会是空的、也不会跟别人撞
     assert group_fingerprint(fp, None, 2223) == ""          # 没有消息列表就什么都读不出

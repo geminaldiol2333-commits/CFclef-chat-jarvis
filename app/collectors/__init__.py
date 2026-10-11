@@ -39,7 +39,7 @@ def build(app, hwnd, emit, debug_on=None) -> BaseCollector:
             scrolls = settings.qq_backfill_scrolls()
         except Exception:
             policy, selectors, interval, grace, capture = "steal", sel_from(None), 1.2, 1.5, False
-            backfill, scrolls = 0, 8
+            backfill, scrolls = 0, 4
         return UiaQqntCollector(hwnd, emit, debug_on, app=app,
                                 selectors=selectors, focus_policy=policy,
                                 read_interval=interval, user_grace=grace,

@@ -290,6 +290,7 @@ def drain():
             if msg[1] == ov.current_chat():
                 ov.invalidate_replies()
                 ov.log(T("已切到新会话，正在读取历史消息…"))
+                ov.set_status(T("正在往上翻历史消息（QQ 只渲染可见的那几条）…"), "busy")
             continue
         if kind == "debug":  # 调试视图的一帧；窗口不在就直接丢掉
             if dbg is not None:

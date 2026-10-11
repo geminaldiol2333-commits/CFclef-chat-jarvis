@@ -256,7 +256,7 @@ hf download ggml-org/Clef-Flash-GGUF Clef-Flash-Q8_0.gguf --local-dir D:\AI_Tool
 | `group_speaker_workers` | `3` | 按发言人判断时最多几路并发（1–8）；本地服务端串行，调大只影响「谁先上屏」 |
 | `group_speaker_max` | `4` | 一次最多给几个人做判断（1–12），只挑最近说过话的 |
 | `qq_backfill_messages` | `30` | 切会话后自动往上翻、最多补齐多少条历史 |
-| `qq_backfill_scrolls` | `8` | 回填时最多往上滚几格（每格 3 个滚轮刻度） |
+| `qq_backfill_scrolls` | `4` | 回填时最多往上滚几次（每次 6 个滚轮刻度） |
 
 ## 支持的聊天软件
 

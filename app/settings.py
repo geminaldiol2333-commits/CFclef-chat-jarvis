@@ -242,8 +242,9 @@ def qq_backfill_messages() -> int:
 
 
 def qq_backfill_scrolls() -> int:
-    """回填时最多往上滚几次（每次 3 格）。默认 8，防止在很长的会话里一直翻。"""
-    return _int("qq_backfill_scrolls", 8, 1, 40)
+    """回填时最多往上滚几次（每次 6 格）。默认 4：滚动本身便宜、每步的**读树**贵
+    （整树 2.4s/遍，只走消息列表 0.8s/遍），所以步数少了反而更快看到消息。"""
+    return _int("qq_backfill_scrolls", 4, 1, 40)
 
 def _read_env(env_name: str) -> str:
     """进程环境优先；没有就读注册表并带进进程环境，之后 core/ 里按 os.environ 读就有了。"""
