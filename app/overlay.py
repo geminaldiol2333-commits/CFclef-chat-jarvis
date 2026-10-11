@@ -528,6 +528,17 @@ class Overlay:
         box.addWidget(self._hint(
             "开了以后群聊里可以选回复给谁，候选会针对 TA 写，填入时可带 @。关了就正常回复。"
         ))
+        group_row = QHBoxLayout()
+        group_row.addWidget(_tlabel("群聊只给判断，不起草", 13), 1)
+        self.groupOnlySwitch = SwitchButton()
+        bind(self.groupOnlySwitch, "开", "setOnText")
+        bind(self.groupOnlySwitch, "关", "setOffText")
+        bind(self.groupOnlySwitch, "群聊只给判断，不起草", "setAccessibleName")
+        group_row.addWidget(self.groupOnlySwitch)
+        box.addLayout(group_row)
+        box.addWidget(self._hint(
+            "群里可能十几个人同时在聊三四件不相关的事，一条「下一句」没意义——开了就只显示判断摘要，"
+            "不起草候选（也就不用加载起草模型）。只有开一个话题的小群才建议关掉。"))
         update_row = QHBoxLayout()
         update_row.addWidget(_tlabel("启动时检查更新", 13), 1)
         self.updateSwitch = SwitchButton()
@@ -975,6 +986,7 @@ class Overlay:
         self.localAutoSwitch.setChecked(settings.local_autostart())
         self.localUnloadSwitch.setChecked(settings.local_idle_unload())
         self.qqFocusBox.setCurrentIndex(0 if settings.qq_focus_policy() == "steal" else 1)
+        self.groupOnlySwitch.setChecked(settings.group_judge_only())
         self._sync_model_fields()  # 上面屏蔽了信号，这里补一次
         self.settingsFeedback.hide()
 
@@ -1031,7 +1043,8 @@ class Overlay:
                           local_autostart_on=self.localAutoSwitch.isChecked(),
                           local_idle_unload_on=self.localUnloadSwitch.isChecked(),
                           qq_focus_policy_text=("steal" if self.qqFocusBox.currentIndex() == 0
-                                                else "foreground"))
+                                                else "foreground"),
+                          group_judge_only_on=self.groupOnlySwitch.isChecked())
         except Exception:
             self._settings_feedback("保存失败，请检查配置文件是否可写后重试。", error=True)
             return
@@ -1341,7 +1354,11 @@ class Overlay:
             self.set_status(lambda: T("正在浏览「{name}」，只看不填；切回这个会话才能用。").format(name=self._shown))
 
     def show(self, result):
-        """按推荐顺序展示，按钮始终绑定 candidates 的原始索引。"""
+        """按推荐顺序展示，按钮始终绑定 candidates 的原始索引。
+
+        result["mode"] == "judge_only" 时没有候选（群聊只判断）：只展示判断摘要，
+        把空态卡藏起来，并说明为什么不起草。"""
+        judge_only = result.get("mode") == "judge_only"
         self.cands = result["candidates"]
         self.set_busy(False)
         self._current = bool(self.cands)
@@ -1374,13 +1391,16 @@ class Overlay:
             color = "#b44832"
         qss = f"BodyLabel {{ color: {color}; background: transparent; }}"
         setCustomStyleSheet(self.tension, qss, qss)
-        self.empty.setVisible(not self.cands)
-        self.insight.setVisible(bool(self.cands))
+        self.empty.setVisible(not self.cands and not judge_only)
+        self.insight.setVisible(bool(self.cands) or judge_only)
         self.referenceNote.setVisible(bool(self.cands) and not self._compact)
         updated_at = datetime.now().strftime("%H:%M")
         bind(self.updated, lambda: updated_at + " " + T("更新"))
         if self.cands:
             self.set_status("建议已更新，选一句适合你的回复", "success")
+        elif judge_only:
+            self.set_status(lambda: T("群聊只给判断参考：群里可能同时在聊几件不相关的事，"
+                                      "一条候选回复没有意义，所以不起草。"), "idle")
         else:
             self.set_status("未生成可用回复，请等待下一条新消息。", "error")
 

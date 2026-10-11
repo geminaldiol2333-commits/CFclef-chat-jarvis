@@ -119,21 +119,33 @@ def _is_local(kind):
             else providers.DRAFT_PROVIDERS[settings.draft_provider()].local)
 
 
+def _is_group_msgs(msgs):
+    """消息里带发言人名 = 群聊（和 core.questions.build_state 的口径一致）。"""
+    return any(len(m) > 2 and m[2] for m in msgs)
+
+
+def _judge_only(msgs):
+    """这一轮要不要只判断、不起草（群聊 + 设置开着）。"""
+    return settings.group_judge_only() and _is_group_msgs(msgs)
+
+
 def analyze_bg(msgs, title, revision, reply_to=None):
     """后台线程只跑网络/推理，结果丢队列；UI 只在主线程的 tick 里动（Qt 不能跨线程碰）。
 
     本地模式先让 local_server 把 llama-server 拉起来（首次要读几 GB 权重，会阻塞这里几十秒，
     但这是后台线程，界面不卡）；远程模式直接用设置里的地址。
+    群聊只判断时**不加载起草模型**：省一次几 GB 的读盘和一份显存。
     """
     try:
         from app import local_server
 
+        judge_only = _judge_only(msgs)
         mgr = local_server.manager()
         jev_base = None
         draft_base = settings.draft_base_url() or None
         if _is_local("jev"):
             jev_base = mgr.ensure("clef")
-        if _is_local("draft"):
+        if _is_local("draft") and not judge_only:
             draft_base = mgr.ensure("draft")
         results.put(("ok", analyze(msgs, settings.relationship(), context=settings.context(),
                                    model=settings.draft_model() or None,
@@ -143,7 +155,8 @@ def analyze_bg(msgs, title, revision, reply_to=None):
                                    thinking=settings.thinking(),
                                    jev_provider=settings.jev_provider(),
                                    jev_model=settings.jev_model() or None,
-                                   jev_base_url=jev_base),
+                                   jev_base_url=jev_base,
+                                   group_judge_only=judge_only),
                      title, revision))
     except Exception as e:
         results.put(("err", f"{T('分析失败: ')}{e}", title, revision))
@@ -177,13 +190,16 @@ def start_analyze(title, msgs):
     if not settings.has_jev_key():
         ov.set_status("请先在设置中配置模型", "warning")
         return
-    if not settings.has_llm_key():
+    judge_only = _judge_only(msgs)
+    if not judge_only and not settings.has_llm_key():
         ov.set_status(lambda name=settings.draft_provider_name():
                       f"{T('起草来源 ')}{name}{T(' 没填密钥，去设置里补上')}", "warning")
         return
     state["busy"] = True
     ov.set_busy(True)
-    if _is_local("jev") or _is_local("draft"):
+    if judge_only:
+        ov.set_status(T("群聊只给判断参考，不起草候选回复"))
+    elif _is_local("jev") or _is_local("draft"):
         ov.set_status(T("本地模型推理中（首次要先加载权重，可能要几十秒）"))
     reply_to = target_of(title) if settings.reply_target() else None  # 开关关着就是今天的行为
     threading.Thread(target=analyze_bg, args=(msgs, title, chat_of(title)["rev"], reply_to),

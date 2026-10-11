@@ -27,7 +27,8 @@ def analyze(messages: list, relationship: str, model: str | None = None,
             timeout: float = 30, context: int = 10, provider: str = "local",
             base_url: str | None = None, reply_to: str | None = None, style: str = "",
             thinking: bool = False, jev_provider: str = "clef",
-            jev_model: str | None = None, jev_base_url: str | None = None) -> dict:
+            jev_model: str | None = None, jev_base_url: str | None = None,
+            group_judge_only: bool = False) -> dict:
     """messages: [(from, text)] from ∈ {her, me}，最新一条在最后；
     群聊里可以带第三项 name（说这句话的人），单聊不带。
     context: 起草和判断各看最近多少条消息（用户设置里的「参考上下文」）。
@@ -37,6 +38,9 @@ def analyze(messages: list, relationship: str, model: str | None = None,
     reply_to: 群聊里指定回复给谁；None = 正常回复。
     style: 用户自己描述的说话风格，只影响起草。
     thinking: 起草时是否开思考模式，只影响起草，默认关。
+    group_judge_only: 群聊只做判断，不起草也不排序（默认关，由调用方按设置传）。
+        群聊里可能十几个人同时在聊几件不相关的事，一条「下一句」没有意义；
+        这种时候连起草模型都不用加载。开启后返回的 candidates 是空的、mode="judge_only"。
     model / jev_model = None 用该来源的默认模型。
 
     返回 {candidates, best_index, best_reply, scores, answers, usage, reply_to}。
@@ -50,6 +54,20 @@ def analyze(messages: list, relationship: str, model: str | None = None,
     usage: dict = {}
     answers: dict = {}
     judged = False
+
+    # 群聊只判断：不起草、不排序。群里多人多话题时「下一条说什么」是个伪命题，
+    # 而且这样连起草模型都不必修/加载。
+    if group_judge_only and (state.get("chat") or {}).get("is_group"):
+        first = ask(state, dict(JUDGE_QUESTIONS), timeout=timeout,
+                    provider=jev_provider, model=jev_model, base_url=jev_base_url)
+        answers = first.get("answers") or {}
+        _add_usage(usage, first.get("usage"))
+        return {
+            "candidates": [], "best_index": 0, "best_reply": "", "scores": [],
+            "answers": answers, "usage": usage, "reply_to": reply_to,
+            "mode": "judge_only",
+        }
+
     try:
         first = ask(state, dict(JUDGE_QUESTIONS), timeout=timeout,
                     provider=jev_provider, model=jev_model, base_url=jev_base_url)
@@ -101,11 +119,13 @@ def analyze(messages: list, relationship: str, model: str | None = None,
         "answers": answers,
         "usage": usage,
         "reply_to": reply_to,
+        "mode": "draft",
     }
 
 
 if __name__ == "__main__":
     # 候选被过滤光时要抛 JevError，不能在取第一条时 IndexError。
+    # 另外：群聊 judge_only 模式不能碰起草函数。
     from unittest.mock import patch
 
     with patch("__main__.ask", return_value={"answers": {}, "usage": {}}), \
@@ -115,4 +135,22 @@ if __name__ == "__main__":
             raise SystemExit("应当抛错")
         except JevError as e:
             assert "没有可用候选" in str(e)
+
+    calls = []
+    def _boom(*a, **k):
+        calls.append(1)
+        raise AssertionError("群聊只判断时不该调用起草")
+
+    group = [("her", "甲说", "张三"), ("her", "乙说", "李四")]
+    with patch("__main__.ask", return_value={"answers": {"danger_level": {"score": 2}}, "usage": {}}), \
+         patch("__main__.draft_candidates", _boom):
+        r = analyze(group, "friends", group_judge_only=True)
+    assert calls == [], "起草被调用了"
+    assert r["mode"] == "judge_only" and r["candidates"] == [] and r["scores"] == []
+    assert r["answers"]["danger_level"]["score"] == 2
+    # 单聊不受影响（还是老三段）
+    with patch("__main__.ask", return_value={"answers": {}, "usage": {}}), \
+         patch("__main__.draft_candidates", return_value=["a", "b", "c"]):
+        r2 = analyze([("her", "hello")], "friends", group_judge_only=True)
+    assert r2["mode"] == "draft" and r2["candidates"] == ["a", "b", "c"]
     print("engine ok")

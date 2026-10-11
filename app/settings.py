@@ -186,6 +186,14 @@ def qq_user_grace_seconds() -> float:
         return 1.5
     return max(0.0, min(30.0, v))
 
+
+def group_judge_only() -> bool:
+    """群聊只做判断，不起草候选回复（默认开）。
+
+    群里可能十几个人同时在聊三四件不相关的事，一条「下一句」没意义；
+    关掉这个开关才会像单聊那样起草——知道自己群里只有一个话题的人可以关。"""
+    return bool(_read("group_judge_only", True))
+
 def _read_env(env_name: str) -> str:
     """进程环境优先；没有就读注册表并带进进程环境，之后 core/ 里按 os.environ 读就有了。"""
     v = os.environ.get(env_name, "").strip()
@@ -259,7 +267,7 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
          local_models_dir_text: str | None = None, local_clef_model_text: str | None = None,
          local_draft_model_text: str | None = None, local_autostart_on: bool | None = None,
          local_idle_unload_on: bool | None = None, local_idle_seconds_n: int | None = None,
-         qq_focus_policy_text: str | None = None) -> None:
+         qq_focus_policy_text: str | None = None, group_judge_only_on: bool | None = None) -> None:
     """每个参数为空/None = 保留当前值。两把 key 写进程环境 + HKCU\\Environment，不写任何文件。"""
     jev = jev_provider_text if jev_provider_text in JEV_PROVIDERS else jev_provider()
     draft = draft_provider_text if draft_provider_text in DRAFT_PROVIDERS else draft_provider()
@@ -300,6 +308,7 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
         "qq_focus_policy": (qq_focus_policy() if qq_focus_policy_text is None
                             else (qq_focus_policy_text if qq_focus_policy_text in ("steal", "foreground")
                                   else qq_focus_policy())),
+        "group_judge_only": flag(group_judge_only_on, group_judge_only),
     }
     with open(_CONFIG, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)

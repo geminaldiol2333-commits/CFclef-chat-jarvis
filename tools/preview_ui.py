@@ -126,7 +126,7 @@ def main() -> int:
                      "local_clef_port": 8790, "local_draft_port": 8791,
                      "local_gpu_layers": 999, "local_clef_ctx": 8192, "local_draft_ctx": 4096,
                      "local_autostart": True, "local_idle_unload": True, "local_idle_seconds": 300,
-                     "qq_focus_policy": "steal"}
+                     "qq_focus_policy": "steal", "group_judge_only": True}
 
     def save_demo_settings(relationship_text=None, context_n=None, *, jev_provider_text=None,
                            jev_key_text=None, jev_model_text=None, draft_provider_text=None,
@@ -136,7 +136,8 @@ def main() -> int:
                            local_llama_server_text=None, local_models_dir_text=None,
                            local_clef_model_text=None, local_draft_model_text=None,
                            local_autostart_on=None, local_idle_unload_on=None,
-                           local_idle_seconds_n=None, qq_focus_policy_text=None):
+                           local_idle_seconds_n=None, qq_focus_policy_text=None,
+                           group_judge_only_on=None):
         if relationship_text:
             demo_settings["relationship"] = relationship_text
         if context_n is not None:
@@ -165,6 +166,8 @@ def main() -> int:
             demo_settings["local_idle_seconds"] = int(local_idle_seconds_n)
         if qq_focus_policy_text:
             demo_settings["qq_focus_policy"] = qq_focus_policy_text
+        if group_judge_only_on is not None:
+            demo_settings["group_judge_only"] = bool(group_judge_only_on)
 
     def fake_jev_models(provider, key, timeout=10):
         """演示不联网：给一小撮假模型，让「获取模型」按钮在本地也走得通。"""
@@ -211,6 +214,7 @@ def main() -> int:
         local_idle_seconds=lambda: demo_settings["local_idle_seconds"],
         qq_focus_policy=lambda: demo_settings["qq_focus_policy"],
         qq_selectors=lambda: {},
+        group_judge_only=lambda: demo_settings["group_judge_only"],
         save=save_demo_settings,
     ):
         from PySide6.QtCore import QTimer
