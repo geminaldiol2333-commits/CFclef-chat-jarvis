@@ -10,9 +10,14 @@
 1. **上游和所有 fork 都没有 QQ NT 支持。** `jev-chat/jev-chat-windows` 全部 11 个近期有提交的 fork，
    `app/chatapps.py` 里一个 QQ 都没有；上游只维护微信这一套。Android 版
    （`Finderchangchang/jev-chat-JARVIS`）**支持 QQ**（读无障碍节点），所以判断口径和题目集是现成的。
-2. **QQ NT 走 UIA 无障碍树**：输入框 `qq-msg-editor`、头部联系人 `chat-header__contact-name`、
-   气泡 `message-container*` / `msg-content-container*`、**己方标记 `container--self`**。
-   己方/对方直接读类名——不用比颜色、不用 OCR、不受主题和 DPI 影响。
+2. **QQ NT 走 UIA 无障碍树**。社区文档给的 CSS 类名（`qq-msg-editor` / `container--self`）
+   在本机 QQ 9.9.31/9.9.36 上**已经查不到了**，但它们留了两个可用的东西：
+   - **结构 id还在**：`ml-root` 就是消息列表（实测子树 386 个节点 / 134 条文本），`func-bar-*` 是输入区工具栏；
+   - **几何还在**：文本节点带真实矩形，输入区是消息列表下面那块**整宽**容器
+     （实测 `(832,956,1880,1095)`，里面装着草稿文字）。
+
+   所以采集器是**双路径**：类名在就用类名（更准），不在就用 `ml-root` + 几何，
+  己方/对方靠**左右对齐**（自己发的靠右）。两条都是读无障碍树，**不 OCR、不比像素**。
 3. **硬前提：QQ 只对前台窗口构建完整 UIA 树**（实测后台只有 9 个节点）。所以读消息前必须让 QQ
    处于活动状态。本项目给了两种策略（设置页可选，默认第一种）：
    - **允许读取时短暂置前**（默认）：置前 + 等 800ms 建树 → 读完把焦点还给原来的窗口。屏幕会闪一下。
@@ -39,15 +44,18 @@
 `LiteLoaderQQNT` ⭐7071 及其插件生态 / `NtQQHook` / `NTQQAntiRecall` —— 这些是协议侧或往 QQ 里注入，
 违反本项目「不 hook、不注入、不碰对方进程/数据库」的硬约束。
 
-## 4. 选择器与三条坑位
+## 4. 选择器：类名优先，ID + 几何兜底
 
-| 用途 | 选择器 | 本项目怎么用 |
+实测（QQ 9.9.36）：无障碍树里 `ClassName` 几乎全是空字符串，`AutomationId` 只在少数元素上。
+所以采集器按这个顺序找：
+
+| 要什么 | 首选（社区类名） | 本机实际走的那条 |
 | --- | --- | --- |
-| 输入框 | `qq-msg-editor` | 取它的 `BoundingRectangle`（屏幕坐标）→ `emit("input", rect)`，填入时点它中心 |
-| 头部联系人 | `chat-header__contact-name` | 当会话名（`emit("chat", name)`）；**不看窗口标题** |
-| 气泡 | 正则 `^(message-container\|msg-content-container)` | 每个容器一个 Turn，文本取 `Name`，为空则拼子节点 |
-| 己方 | `container--self` | 命中 = `who="me"`，否则 `"her"` |
-| 发言人名（群聊） | 类名含 `nickname`/`sender`/`member-name`；没有类名时取紧贴气泡上方的短文本 | 排除头部联系人/输入框/气泡本身，并要求几何上紧邻 |
+| 消息列表 | 气泡类名 `message-container*` 的公共祖先 | **`id=ml-root`**（实测 rect `(832,325,1880,907)`） |
+| 输入区 | `qq-msg-editor` | 消息列表下方、聊天区内、**横跨整宽**的容器（优先取“里面含文字”那块）；再把高度砍到上 60% 再把矩形交给父进程，保证点到打字区而不是工具栏 |
+| 会话名 | `chat-header__contact-name` | 消息列表上方 80px 内、最靠左的那条文本（实测 len=12；不会再抓到标题栏那个 1 字符按钮） |
+| 消息 | 气泡容器 + `container--self` | `ml-root` 里按 y 聚行的文本；行中心在列表中线右侧 = 我发的 |
+| 发言人名（群聊） | 类名含 `nickname`/`sender` | 类名路径下靠“紧贴气泡上方的短文本”；几何路径下拿不到（留空） |
 
 三条必须处理的坑：
 
@@ -62,10 +70,11 @@
 ## 5. 实现与验证
 
 ```
-app/collectors/uia_map.py    纯逻辑：树 → Node → 会话名/输入框/气泡/己方/顺序/去重（不依赖 uiautomation）
+app/collectors/uia_map.py    纯逻辑：树 → Node → 消息列表/输入区/会话名/消息行/左右对齐/去重
+                             （不依赖 uiautomation，可完全离线自测）
 app/collectors/uia_qqnt.py   活体采集器：抓树、前台策略、发事件（chat/area/input/lines/status）
 app/chatapps.py              QQNT 条目：exes=("qq.exe",)、collector="uia"
-app/settings.py              qq_focus_policy（steal|foreground）、qq_selectors（覆盖类名）
+app/settings.py              qq_focus_policy（steal|foreground）、qq_selectors（覆盖选择器）
 ```
 
 **无头自测（不需要 QQ、不需要 uiautomation、不开任何窗口）**：

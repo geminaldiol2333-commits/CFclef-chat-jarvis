@@ -21,8 +21,9 @@ import ctypes.wintypes as w
 import time
 
 from app.collectors.base import BaseCollector, Capabilities
-from app.collectors.uia_map import (Node, build_turns, detect_mode, find_editor, find_session,
-                                    new_turns, pane_bounds, sel_from)
+from app.collectors.uia_map import (Node, build_turns, detect_mode, find_editor,
+                                    find_message_list, find_session, new_turns, pane_bounds,
+                                    sel_from)
 from app.textsim import similar
 
 u32, k32 = ctypes.windll.user32, ctypes.windll.kernel32
@@ -34,6 +35,16 @@ TREE_BUDGET = 80000      # 节点上限，防止异常布局把子进程拖死
 TREE_DEPTH = 60
 TINY_TREE = 40           # 少于这么多节点 = 多半是「后台窗口只有 9 个节点」那种状态
 REVIVE_WAIT = 0.8        # 等 Chromium 把无障碍树建出来（社区实测 800ms）
+
+
+def _click_box(rect: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    """把输入区矩形收一下再交给父进程点：容器可能把下面的工具栏一起包住（实测高度 259），
+    取上 60% 保证中心点落在打字区而不是工具栏按钮上。"""
+    l, t, r, b = rect
+    h = b - t
+    if h > 200:
+        b = t + int(h * 0.6)
+    return (l, t, r, b)
 
 
 class UiaQqntCollector(BaseCollector):
@@ -149,7 +160,7 @@ class UiaQqntCollector(BaseCollector):
                                       cls=c.ClassName or "",
                                       aid=getattr(c, "AutomationId", "") or "",
                                       rect=(r.left, r.top, r.right, r.bottom),
-                                      text=c.Name or ""))
+                                      text=c.Name or "", text_len=len(c.Name or "")))
                 except Exception:
                     continue
                 walk(c, depth + 1, idx)
@@ -188,11 +199,16 @@ class UiaQqntCollector(BaseCollector):
         panel = next((n for n in nodes if n.depth == 0 and n.has_geo), None)
         panel_rect = panel.rect if panel else (0, 0, 0, 0)
         pane_left, _ = pane_bounds(nodes, panel_rect)
+        panel_right = panel_rect[2] or 0
+
+        # 消息列表根（实测 id=ml-root）；类名世界中就是气泡的公共祖先
+        list_node = find_message_list(nodes, pane_left)
 
         # 「只有十来个节点而且什么都认不出」= 就是后台窗口那棵空树（实测 9 个节点）
         has_bubbles = any(any(x in n.key for x in self.sel.bubble) for n in nodes)
-        editor = find_editor(nodes, pane_left, self.sel)
-        if len(nodes) < TINY_TREE and not has_bubbles and editor is None:
+        editor = find_editor(nodes, pane_left, self.sel, list_node=list_node,
+                             panel_right=panel_right)
+        if len(nodes) < TINY_TREE and not has_bubbles and editor is None and list_node is None:
             self._note_once(
                 "tiny",
                 f"只读到 {len(nodes)} 个控件、且认不出任何气泡或输入框——"
@@ -201,24 +217,30 @@ class UiaQqntCollector(BaseCollector):
             return
 
         # 2. 会话名 / 聊天区
-        name = find_session(nodes, pane_left, self.sel)
+        name = find_session(nodes, pane_left, self.sel, list_node=list_node,
+                            panel_right=panel_right)
         if name and name != self.title:
             self.title = name
             self.seen.clear()          # 换会话：去重状态跟着换（和 OCR 采集器一致）
             emit("chat", name)
         ox, oy = self._window_origin()
-        pane = [n for n in nodes if n.has_geo and n.rect[0] >= pane_left]
-        if pane:
-            l = min(n.rect[0] for n in pane); t = min(n.rect[1] for n in pane)
-            r = max(n.rect[2] for n in pane); b = max(n.rect[3] for n in pane)
-            area = (l - ox, t - oy, r - ox, b - oy)      # 窗口内坐标，和微信那边一致
+        # area：父进程只拿它当「能不能填」的护栏（QQ 靠 input 事件定位），
+        # 所以直接用消息列表的矩形；不能拿全聊天区节点的并集——消息列表是虚拟列表，
+        # 里面的 y 会是负数（实测到 -2522），并集会变成一坨垃圾值。
+        pane = [n for n in nodes if n.has_geo and n.rect[0] >= pane_left - 8]
+        box = list_node.rect if list_node is not None and list_node.has_geo else None
+        if box is None and pane:
+            box = (min(n.rect[0] for n in pane), min(n.rect[1] for n in pane),
+                   max(n.rect[2] for n in pane), max(n.rect[3] for n in pane))
+        if box is not None:
+            area = (box[0] - ox, box[1] - oy, box[2] - ox, box[3] - oy)
             if area != self.last_area:
                 self.last_area = area
                 emit("area", area)
 
         # 3. 输入框（屏幕坐标，父进程直接点它）
         if editor is not None and editor.has_geo:
-            rect = tuple(editor.rect)
+            rect = _click_box(tuple(editor.rect))
             if rect != self.last_input:
                 self.last_input = rect
                 emit("input", rect)
@@ -228,7 +250,7 @@ class UiaQqntCollector(BaseCollector):
                             "可在 config.json 里用 qq_selectors.editor 覆盖类名。")
 
         # 4. 消息
-        turns = build_turns(nodes, self.sel, pane_left=pane_left)
+        turns = build_turns(nodes, self.sel, pane_left=pane_left, list_node=list_node)
         if not turns:
             self._note_once("no-bubbles",
                             "没读到气泡（message-container / msg-content-container）——"
