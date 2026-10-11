@@ -114,17 +114,28 @@ def main() -> int:
     configured = "" if args.state == "setup" else "demo-key"
     demo_settings = {"relationship": "friends", "context": 10,
                      "jev_key": configured, "llm_key": configured,
-                     "jev_provider": "openrouter", "jev_model": "typesafe/jev-1.13",
-                     "draft_provider": "deepseek", "draft_model": "deepseek-flash",
+                     "jev_provider": "clef", "jev_model": "clef-flash",
+                     "draft_provider": "local", "draft_model": "local-draft",
                      "draft_base_url": "", "reply_target": True,
                      "style": "话少，基本不用标点，急了才发感叹号", "thinking": False,
-                     "check_update": True, "debug_view": args.state == "debug"}
+                     "check_update": False, "debug_view": args.state == "debug",
+                     "local_llama_server": r"D:\AI_Tools\llama.cpp\b11515\llama-server.exe",
+                     "local_models_dir": r"D:\AI_Tools\models",
+                     "local_clef_model": r"D:\AI_Tools\models\ggml-org_Clef-Flash-GGUF\Clef-Flash-Q8_0.gguf",
+                     "local_draft_model": r"D:\AI_Tools\models\Cloudflare_clef-flash-Q8_0.gguf",
+                     "local_clef_port": 8790, "local_draft_port": 8791,
+                     "local_gpu_layers": 999, "local_clef_ctx": 8192, "local_draft_ctx": 4096,
+                     "local_autostart": True, "local_idle_unload": True, "local_idle_seconds": 300}
 
     def save_demo_settings(relationship_text=None, context_n=None, *, jev_provider_text=None,
                            jev_key_text=None, jev_model_text=None, draft_provider_text=None,
                            llm_key_text=None, draft_model_text=None, draft_base_url_text=None,
                            reply_target_on=None, style_text=None, thinking_on=None,
-                           check_update_on=None, debug_view_on=None):
+                           check_update_on=None, debug_view_on=None,
+                           local_llama_server_text=None, local_models_dir_text=None,
+                           local_clef_model_text=None, local_draft_model_text=None,
+                           local_autostart_on=None, local_idle_unload_on=None,
+                           local_idle_seconds_n=None):
         if relationship_text:
             demo_settings["relationship"] = relationship_text
         if context_n is not None:
@@ -138,9 +149,19 @@ def main() -> int:
             if key:
                 demo_settings[name] = key
         for name, value in (("reply_target", reply_target_on), ("thinking", thinking_on),
-                            ("check_update", check_update_on), ("debug_view", debug_view_on)):
+                            ("check_update", check_update_on), ("debug_view", debug_view_on),
+                            ("local_autostart", local_autostart_on),
+                            ("local_idle_unload", local_idle_unload_on)):
             if value is not None:
                 demo_settings[name] = bool(value)
+        for name, value in (("local_llama_server", local_llama_server_text),
+                            ("local_models_dir", local_models_dir_text),
+                            ("local_clef_model", local_clef_model_text),
+                            ("local_draft_model", local_draft_model_text)):
+            if value is not None:
+                demo_settings[name] = value
+        if local_idle_seconds_n is not None:
+            demo_settings["local_idle_seconds"] = int(local_idle_seconds_n)
 
     def fake_jev_models(provider, key, timeout=10):
         """演示不联网：给一小撮假模型，让「获取模型」按钮在本地也走得通。"""
@@ -173,6 +194,18 @@ def main() -> int:
         thinking=lambda: demo_settings["thinking"],
         check_update=lambda: demo_settings["check_update"],
         debug_view=lambda: demo_settings["debug_view"],
+        local_llama_server=lambda: demo_settings["local_llama_server"],
+        local_models_dir=lambda: demo_settings["local_models_dir"],
+        local_clef_model=lambda: demo_settings["local_clef_model"],
+        local_draft_model=lambda: demo_settings["local_draft_model"],
+        local_clef_port=lambda: demo_settings["local_clef_port"],
+        local_draft_port=lambda: demo_settings["local_draft_port"],
+        local_gpu_layers=lambda: demo_settings["local_gpu_layers"],
+        local_clef_ctx=lambda: demo_settings["local_clef_ctx"],
+        local_draft_ctx=lambda: demo_settings["local_draft_ctx"],
+        local_autostart=lambda: demo_settings["local_autostart"],
+        local_idle_unload=lambda: demo_settings["local_idle_unload"],
+        local_idle_seconds=lambda: demo_settings["local_idle_seconds"],
         save=save_demo_settings,
     ):
         from PySide6.QtCore import QTimer

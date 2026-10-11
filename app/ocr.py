@@ -9,29 +9,18 @@ from rapidocr_onnxruntime import RapidOCR
 
 from app.chatapps import DEFAULT, ChatApp
 
-_ENGINES: dict = {}   # backend name -> engine, shared per process
-_FELL_BACK = set()    # backends that failed once; don't retry every frame
+_ENGINE = None  # one RapidOCR instance per process (~40MB); every Reader shares it
 
 
 def _engine(app: ChatApp = DEFAULT):
     """OCR 引擎全进程共用：一个实例 ~40MB，每个会话一个 Reader，不能各带一个。
     det_limit_type 默认 'min' 会把小图放大到短边 736，裁小反而更慢；必须 'max'。
-
-    RapidOCR 的内置模型只有中英文，韩日文全是乱码，所以这类界面走 Windows 自带 OCR
-    （离线、随系统语言包装好，见 app/ocr_windows.py）；没有对应识别器就退回 RapidOCR。"""
-    want = app.ocr if app.ocr not in _FELL_BACK else "rapidocr"
-    if want not in _ENGINES:
-        if want == "windows":
-            try:
-                from app.ocr_windows import WindowsOcr
-                _ENGINES[want] = WindowsOcr()
-            except Exception:
-                _FELL_BACK.add("windows")
-                return _engine(app)
-        else:
-            _ENGINES[want] = RapidOCR(intra_op_num_threads=4, det_limit_type="max",
-                                      det_limit_side_len=4000)
-    return _ENGINES[want]
+    app 参数留着是为了调用方签名稳定（每个 ChatApp 现在都走 RapidOCR 的中英文模型）。"""
+    global _ENGINE
+    if _ENGINE is None:
+        _ENGINE = RapidOCR(intra_op_num_threads=4, det_limit_type="max",
+                           det_limit_side_len=4000)
+    return _ENGINE
 
 
 def read_title(header, app: ChatApp = DEFAULT):
@@ -53,7 +42,7 @@ def who_said(chat, box, app: ChatApp = DEFAULT):
     绿底 → me；非绿且文字对底色对比度 ≥150 → her；其余（引用块、群里的发言人名、时间戳、系统提示、
     链接卡片描述——都是灰字，对比度 80~95）→ "gray"。
     实测：气泡正文对比度 178~208，me 绿泡 142~150，灰字 ≤ 93。深浅主题都靠这套。
-    哪种底色算 "me" 由 app.is_me 决定（微信绿 / KakaoTalk 黄）。
+    哪种底色算 "me" 由 app.is_me 决定（微信绿）。
     墨高 = 框里最长一段连续有字的行数（OCR 框对小字有固定 padding、还会蹭到上下行，不能拿框高比大小）。"""
     xs, ys = [p[0] for p in box], [p[1] for p in box]
     reg = chat[int(min(ys)):int(max(ys)), int(min(xs)):int(max(xs))].astype(int)
@@ -71,7 +60,7 @@ def who_said(chat, box, app: ChatApp = DEFAULT):
     for r in (diff > 60).any(axis=1):
         best = best + 1 if r else 0
         ink_h = max(ink_h, best)
-    if app.is_me(bg):  # 自己的气泡：微信是绿色，KakaoTalk 是 #FEE500（见 app/chatapps.py）
+    if app.is_me(bg):  # 自己的气泡：微信是绿色（见 app/chatapps.py）
         return "me", bg, ink_h
     return ("her" if diff.max() >= 150 else "gray"), bg, ink_h
 
@@ -114,7 +103,7 @@ class Reader:
             xs, ys = [p[0] for p in box], [p[1] for p in box]
             rect = (int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)))
             # 印在面板底色上的字都不是消息：气泡自带底色。微信的发言人名是灰字，
-            # KakaoTalk 的是深色（对比度跟正文一样），所以不能只看 kind == "gray"。
+            # 所以拿要不要当成名字还得看它在不在左边、短不短（见下面 taken）。
             on_pane = np.abs(bg - pane_bg).sum() <= 6
             if kind == "gray" or (on_pane and kind == "her"):
                 taken = bool(on_pane and box[0][0] < 0.25 * W and len(text) <= 16

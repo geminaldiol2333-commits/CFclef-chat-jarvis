@@ -63,10 +63,6 @@ def style() -> str:
     """用户自己描述的说话风格（可选，自由文本），只喂给起草模型。默认空 = 只照着最近的消息模仿。"""
     return str(_read("style") or "")
 
-def language() -> str:
-    """配置中选择的界面语言；启动环境变量的覆盖由 i18n 处理。"""
-    return str(_read("lang") or "zh").strip().lower()
-
 def jev_provider() -> str:
     """判断模型走哪家：openrouter（默认）或 typesafe 直连。"""
     v = _read("jev_provider")
@@ -223,7 +219,7 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
          draft_base_url_text: str | None = None, reply_target_on: bool | None = None,
          style_text: str | None = None, thinking_on: bool | None = None,
          check_update_on: bool | None = None, debug_view_on: bool | None = None,
-         lang_text: str | None = None, local_llama_server_text: str | None = None,
+         local_llama_server_text: str | None = None,
          local_models_dir_text: str | None = None, local_clef_model_text: str | None = None,
          local_draft_model_text: str | None = None, local_autostart_on: bool | None = None,
          local_idle_unload_on: bool | None = None, local_idle_seconds_n: int | None = None) -> None:
@@ -265,8 +261,5 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
         "local_idle_seconds": (local_idle_seconds() if local_idle_seconds_n is None
                                else max(30, min(86400, int(local_idle_seconds_n)))),
     }
-    lang = _read("lang") if lang_text is None else lang_text.strip().lower()
-    if lang is not None:
-        data["lang"] = lang
     with open(_CONFIG, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)

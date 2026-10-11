@@ -92,12 +92,6 @@ def on_debug_closed():
     settings.save(debug_view_on=False)
 
 
-def on_language_changed():
-    """主界面切换语言后，同步刷新已经打开过的调试窗。"""
-    if dbg is not None:
-        dbg.retranslate()
-
-
 def on_toggle_capture(on):
     """标题栏开关。启动时没找到微信就没有子进程，这会儿再找一次，找到了才真开得起来。"""
     global child
@@ -320,7 +314,6 @@ if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本�
     child = dbg = None
     ov = Overlay(on_fill=fill_reply, on_toggle_capture=on_toggle_capture,
                  on_target_change=on_target_change, on_toggle_debug=set_debug,
-                 on_language_changed=on_language_changed,
                  result_of=lambda t: chats.get(t, {}).get("result"))
     try:
         state["hwnd"], found = find_chat_hwnd()

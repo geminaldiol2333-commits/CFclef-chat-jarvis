@@ -15,8 +15,7 @@ u32 = ctypes.windll.user32
 def find_chat_hwnd(want=None):
     """枚举可见顶层窗口，按进程名认出聊天软件，返回 (hwnd, ChatApp)。
     微信：同进程还有工具窗和看图窗，面积可能更大，所以按标题挑主窗口。
-    KakaoTalk：一个对话一个窗口，主列表窗（标题「카카오톡」）不是目标，挑剩下最大的那个。
-    want=某个 ChatApp 时只找它，None 时先到先得（两个都开着就按 APPS 顺序）。"""
+    want=某个 ChatApp 时只找它，None 时先到先得（多个都开着就按 APPS 顺序）。"""
     k32 = ctypes.windll.kernel32
     found = []
 

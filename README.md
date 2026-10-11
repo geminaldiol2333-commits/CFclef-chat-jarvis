@@ -253,9 +253,10 @@ hf download ggml-org/Clef-Flash-GGUF Clef-Flash-Q8_0.gguf --local-dir D:\AI_Tool
 | 软件 | OCR | 自己的气泡 | 窗口 |
 | --- | --- | --- | --- |
 | 微信 | RapidOCR（中英文模型） | 绿色 | 标题为「微信」的主窗口 |
-| KakaoTalk（韩国） | Windows.Media.Ocr（系统语言包，离线） | `#FEE500` | 一个对话一个窗口，主列表窗除外 |
 
-新增一个软件只要在 `app/chatapps.py` 里加一行。
+新增一个软件只要在 `app/chatapps.py` 里加一行（窗口进程名、要挑哪个窗口、哪种底色算自己说的）。
+OCR 用 RapidOCR 的中英文模型；上游为韩文 KakaoTalk 加的 Windows.Media.Ocr 后端已经随 KakaoTalk
+适配一起移除了（历史版本见 git 记录）。
 
 ## 故障排查
 
@@ -274,7 +275,6 @@ hf download ggml-org/Clef-Flash-GGUF Clef-Flash-Q8_0.gguf --local-dir D:\AI_Tool
 
 ## 已知限制
 
-- 设置页新增的「本地模型」卡片目前只有中文（界面语言选韩语时这块回退成中文，其余界面照常韩文）。
 - 判断与起草两个模型同时驻留显存，显存占用按两者之和算；没有做「用完一个换另一个」的串行加载。
 
 ## 授权

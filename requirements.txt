@@ -16,7 +16,5 @@ typesafe-sdk                  # optional: remote TypeSafe judge (设置里选 Ty
 anthropic                     # optional: Anthropic Messages remote drafting
 google-genai                  # optional: Google Gemini remote drafting
 
-winsdk                        # Windows.Media.Ocr: the ko/ja recognizers RapidOCR's zh/en models lack
-
 # optional, only for the two old UIA probes (already disproved; install to reproduce)
 # uiautomation                # probe_win.py / probe_win2.py
